@@ -409,6 +409,8 @@ fn safe_json_ft_transfer(recipient: &str, amount: &str) -> Vec<u8> {
 pub struct Contract {
     /// Nostr npub hex (32-byte x-only public key) of the contract owner.
     /// All admin actions require a schnorr signature from this key.
+    /// Contract version for migration tracking.
+    version: u32,
     owner_npub: String,
     wallets: LookupMap<String, Wallet>,
     intents: LookupMap<String, Intent>,
@@ -431,6 +433,7 @@ impl Contract {
     #[allow(dead_code)]
     fn init_state(&mut self) {
         if self.paused {} // ensure field exists on old state
+        if self.version == 0 { self.version = 2; } // migration from v0/v1
     }
 
     /// Assert contract is not paused.
@@ -462,6 +465,11 @@ impl Contract {
     /// Check if contract is paused.
     pub fn is_paused(&self) -> bool {
         self.paused
+    }
+
+    /// Get contract version.
+    pub fn get_version(&self) -> u32 {
+        self.version
     }
 
     // ── Wallet Storage Helpers (with migration) ──────────────────────
@@ -510,6 +518,7 @@ impl Contract {
     pub fn new(owner_npub: String) -> Self {
         assert!(!owner_npub.is_empty(), "ERR_EMPTY_OWNER_NPUB");
         Self {
+            version: 2,
             owner_npub,
             wallets: LookupMap::new(StorageKey::Wallets),
             intents: LookupMap::new(StorageKey::Intents),
@@ -949,6 +958,11 @@ impl Contract {
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
         assert!(intent.active, "ERR_INTENT_INACTIVE");
         assert!(intent.approval_threshold == 1, "ERR_NOT_SOLO: quick_execute only works with approval_threshold=1");
+
+        // Check owner is a proposer
+        let predecessor = env::predecessor_account_id();
+        let owner_is_proposer = intent.proposers.is_empty() || intent.proposers.contains(&predecessor);
+        assert!(owner_is_proposer, "ERR_NOT_PROPOSER: caller not in intent proposers");
 
         // Check owner is in nostr_approvers
         let owner_is_approver = intent.nostr_approvers.iter().any(|p| p == &self.owner_npub);
@@ -1761,6 +1775,13 @@ impl Contract {
 
     fn emit_event(&mut self, event: &str, data: serde_json::Value) {
         self.event_nonce += 1;
+        let mut enriched = data;
+        // Inject standard fields for indexer convenience
+        if let Some(obj) = enriched.as_object_mut() {
+            obj.insert("event_nonce".to_string(), serde_json::json!(self.event_nonce));
+            obj.insert("block_height".to_string(), serde_json::json!(env::block_height()));
+            obj.insert("block_ts".to_string(), serde_json::json!(env::block_timestamp()));
+        }
         env::log_str(&format!(
             "EVENT_JSON:{}",
             serde_json::json!({
@@ -1768,7 +1789,7 @@ impl Contract {
                 "version": "1.0.0",
                 "event": event,
                 "nonce": self.event_nonce,
-                "data": data,
+                "data": enriched,
             })
         ));
     }
