@@ -56,6 +56,7 @@ pub fn build_message(
 }
 
 /// Verify an ed25519 signature over a message
+#[allow(dead_code)]
 pub fn verify_signature(public_key: &str, signature_hex: &str, message: &str) {
     // Parse public key (strip "ed25519:" prefix if present)
     let pk_str = public_key.strip_prefix("ed25519:").unwrap_or(public_key);
@@ -113,6 +114,7 @@ pub fn hex_decode(s: &str) -> Vec<u8> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }

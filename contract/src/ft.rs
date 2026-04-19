@@ -206,6 +206,9 @@ mod tests {
             created_at: 0, storage_deposit: 0, storage_used: 0,
             allowed_tokens: vec![],
             ft_token_count: 0,
+            call_allowed_receivers: vec![], call_max_deposit: 0,
+            daily_spend_limit: 0, daily_spend_reset_at: 0, daily_spend_used: 0,
+            relayer_fee: 0, allowed_relayers: vec![],
         };
         // Empty list = accept all
         assert!(is_token_allowed(&wallet, &"anything.near".parse().unwrap()));
@@ -221,6 +224,9 @@ mod tests {
             created_at: 0, storage_deposit: 0, storage_used: 0,
             allowed_tokens: vec![token.clone()],
             ft_token_count: 0,
+            call_allowed_receivers: vec![], call_max_deposit: 0,
+            daily_spend_limit: 0, daily_spend_reset_at: 0, daily_spend_used: 0,
+            relayer_fee: 0, allowed_relayers: vec![],
         };
         assert!(is_token_allowed(&wallet, &token));
         assert!(!is_token_allowed(&wallet, &"evil.near".parse().unwrap()));

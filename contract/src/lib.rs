@@ -1,5 +1,5 @@
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
-use near_sdk::collections::LookupMap;
+use near_sdk::collections::{LookupMap, Vector};
 use near_sdk::json_types::U128;
 use near_sdk::{
     env, log, near, near_bindgen, AccountId, BorshStorageKey, NearToken,
@@ -20,6 +20,7 @@ const MAX_EXPIRY_NS: u64 = 365 * 24 * 60 * 60 * 1_000_000_000;
 /// Maximum active proposals per intent
 const MAX_ACTIVE_PROPOSALS: u32 = 100;
 /// Maximum approvers per intent (bitmap is u64)
+#[allow(dead_code)]
 const MAX_APPROVERS: usize = 64;
 /// Storage deposit per wallet (covers wallet + 3 meta-intents + headroom)
 const STORAGE_DEPOSIT_YOCTO: u128 = 500_000_000_000_000_000_000_000; // 0.5 NEAR
@@ -37,6 +38,7 @@ enum StorageKey {
     Intents,
     Proposals,
     Delegations,
+    WalletNames,
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -109,10 +111,12 @@ pub struct Intent {
 }
 
 impl Intent {
+    #[allow(dead_code)]
     fn is_proposer(&self, account: &AccountId) -> bool {
         self.proposers.contains(account)
     }
 
+    #[allow(dead_code)]
     fn execution_gas(&self) -> near_sdk::Gas {
         let tgas = if self.execution_gas_tgas == 0 {
             DEFAULT_EXECUTION_GAS_TGAS
@@ -187,6 +191,7 @@ impl Proposal {
         self.cancellation_bitmap.count_ones() + self.nostr_cancellation_bitmap.count_ones()
     }
 
+    #[allow(dead_code)]
     fn has_approved(&self, idx: usize) -> bool {
         (self.approval_bitmap & (1u64 << idx)) != 0
     }
@@ -195,6 +200,7 @@ impl Proposal {
         (self.nostr_approval_bitmap & (1u64 << idx)) != 0
     }
 
+    #[allow(dead_code)]
     fn set_approval(&mut self, idx: usize) {
         let mask = 1u64 << idx;
         self.cancellation_bitmap &= !mask;
@@ -207,6 +213,7 @@ impl Proposal {
         self.nostr_approval_bitmap |= mask;
     }
 
+    #[allow(dead_code)]
     fn set_cancellation(&mut self, idx: usize) {
         let mask = 1u64 << idx;
         self.approval_bitmap &= !mask;
@@ -333,6 +340,7 @@ impl Wallet {
     }
 
     /// Check if a relayer is allowed
+    #[allow(dead_code)]
     fn is_relayer_allowed(&self, relayer: &AccountId) -> bool {
         self.allowed_relayers.is_empty() || self.allowed_relayers.contains(relayer)
     }
@@ -364,6 +372,7 @@ fn hash_params(params: &[ParamDef]) -> String {
 }
 
 /// Panic if the call comes from a contract (not a direct user transaction).
+#[allow(dead_code)]
 fn assert_direct_call() {
     assert_eq!(
         env::signer_account_id(),
@@ -373,6 +382,7 @@ fn assert_direct_call() {
 }
 
 /// Get the hex representation of the signer's ed25519 public key (32 bytes, no prefix).
+#[allow(dead_code)]
 fn signer_pk_hex() -> String {
     let pk = env::signer_account_pk();
     let bytes = pk.into_bytes();
@@ -407,11 +417,14 @@ pub struct Contract {
     event_nonce: u64,
     /// Monotonic counter for replay protection. Each owner action increments this.
     owner_nonce: u64,
+    /// Ordered list of wallet names for enumeration.
+    wallet_names: Vector<String>,
 }
 
 #[near_bindgen]
 impl Contract {
     /// State migration: called on deserialization to handle new fields.
+    #[allow(dead_code)]
     fn init_state(&mut self) {
         // Wallet migration is handled lazily via wallet_get/wallet_insert helpers.
     }
@@ -469,6 +482,7 @@ impl Contract {
             delegations: LookupMap::new(StorageKey::Delegations),
             event_nonce: 0,
             owner_nonce: 0,
+            wallet_names: Vector::new(StorageKey::WalletNames),
         }
     }
 
@@ -482,6 +496,7 @@ impl Contract {
     }
 
     /// Verify owner without consuming nonce (for read-only checks or backward compat)
+    #[allow(dead_code)]
     fn verify_owner_readonly(&self, action: &str, signature: &str, expires_at: u64) {
         assert!(expires_at > env::block_timestamp(), "ERR_SIG_EXPIRED");
         let msg = format!("expires {}.000000000: {} | contract: owner", expires_at, action);
@@ -530,6 +545,7 @@ impl Contract {
             allowed_relayers: Vec::new(),
         };
         self.wallet_insert(&name, &wallet);
+        self.wallet_names.push(&name);
         self.create_meta_intents(&name, &env::predecessor_account_id());
         let storage_used = env::storage_usage() - initial_storage;
 
@@ -1146,14 +1162,18 @@ impl Contract {
         self.event_nonce
     }
 
-    /// List all wallet names owned by the contract owner.
-    /// Uses owner_nonce as hint for iteration range (scans owner_nonce * 10).
-    pub fn list_wallets(&self) -> Vec<String> {
-        // We store wallets by name, not by owner. Need to iterate.
-        // Since LookupMap doesn't support iteration, we maintain a prefix scan.
-        // For now, return wallet names if they match the caller as owner.
-        // Note: This is a known limitation — ideally we'd use UnorderedMap.
-        Vec::new()
+    /// List all wallet names on this contract.
+    pub fn list_wallets(&self, from_index: u64, limit: u64) -> Vec<String> {
+        let start = from_index.min(self.wallet_names.len());
+        let end = (start + limit).min(self.wallet_names.len());
+        (start..end)
+            .filter_map(|i| self.wallet_names.get(i))
+            .collect()
+    }
+
+    /// Get total number of wallets.
+    pub fn get_wallet_count(&self) -> u64 {
+        self.wallet_names.len()
     }
 
     /// Get comprehensive wallet state: wallet, intents, balances, recent proposals
