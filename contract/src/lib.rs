@@ -1019,6 +1019,7 @@ impl Contract {
         let pkey = proposal_key(wallet_name, proposal_id);
         let mut proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
         assert!(proposal.status == ProposalStatus::Approved, "ERR_NOT_APPROVED");
+        assert!(proposal.expires_at > env::block_timestamp(), "ERR_PROPOSAL_EXPIRED");
 
         let ikey = intent_key(wallet_name, proposal.intent_index);
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
@@ -1201,9 +1202,13 @@ impl Contract {
         self.proposals.get(&proposal_key(&wallet_name, id))
     }
 
+    /// List proposals — capped at 100 to prevent gas exhaustion.
+    /// Use get_proposals_paginated for large wallets.
     pub fn list_proposals(&self, wallet_name: String) -> Vec<Proposal> {
         let Some(wallet) = self.wallet_get_readonly(&wallet_name) else { return Vec::new(); };
-        (0..wallet.proposal_index)
+        let limit = wallet.proposal_index.min(100);
+        let start = wallet.proposal_index.saturating_sub(limit);
+        (start..wallet.proposal_index)
             .filter_map(|i| self.proposals.get(&proposal_key(&wallet_name, i)))
             .collect()
     }
@@ -1450,14 +1455,37 @@ impl Contract {
         assert!(!proposal_ids.is_empty(), "ERR_EMPTY_BATCH");
         assert!(proposal_ids.len() <= 10, "ERR_BATCH_TOO_LARGE: max 10");
 
-        for proposal_id in &proposal_ids {
-            self.execute_proposal(&wallet_name, *proposal_id);
+        // Pre-validate all proposals before executing any
+        for &proposal_id in &proposal_ids {
+            let pkey = proposal_key(&wallet_name, proposal_id);
+            let proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
+            assert!(proposal.status == ProposalStatus::Approved, "ERR_BATCH_NOT_APPROVED: proposal {}", proposal_id);
+        }
+
+        let mut executed = 0u32;
+        let mut failed = Vec::new();
+        for &proposal_id in &proposal_ids {
+            let pkey = proposal_key(&wallet_name, proposal_id);
+            // Re-check status (previous execution may have side effects)
+            if let Some(proposal) = self.proposals.get(&pkey) {
+                if proposal.status == ProposalStatus::Approved {
+                    self.execute_proposal(&wallet_name, proposal_id);
+                    executed += 1;
+                } else {
+                    failed.push(proposal_id);
+                }
+            } else {
+                failed.push(proposal_id);
+            }
         }
 
         self.emit_event("batch_executed", serde_json::json!({
-            "wallet": wallet_name, "count": proposal_ids.len(),
+            "wallet": wallet_name,
+            "requested": proposal_ids.len(),
+            "executed": executed,
+            "failed": failed,
         }));
-        log!("Batch executed {} proposals in wallet '{}'", proposal_ids.len(), wallet_name);
+        log!("Batch executed {}/{} proposals in wallet '{}'", executed, proposal_ids.len(), wallet_name);
     }
 
     // ── Auto Cleanup ──────────────────────────────────────────────────
