@@ -37,6 +37,7 @@ impl Contract {
         amount: U128,
         msg: String,
     ) -> PromiseOrValue<U128> {
+        self.assert_not_paused();
         let token_account = env::predecessor_account_id();
         let wallet_name = if msg.is_empty() {
             sender_id.as_str().to_string()

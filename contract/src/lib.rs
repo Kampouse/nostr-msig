@@ -419,6 +419,10 @@ pub struct Contract {
     owner_nonce: u64,
     /// Ordered list of wallet names for enumeration.
     wallet_names: Vector<String>,
+    /// Emergency pause flag — when true, only unpause() works.
+    paused: bool,
+    /// Reentrancy guard — true while executing a cross-contract call.
+    locked: bool,
 }
 
 #[near_bindgen]
@@ -426,7 +430,38 @@ impl Contract {
     /// State migration: called on deserialization to handle new fields.
     #[allow(dead_code)]
     fn init_state(&mut self) {
-        // Wallet migration is handled lazily via wallet_get/wallet_insert helpers.
+        if self.paused {} // ensure field exists on old state
+    }
+
+    /// Assert contract is not paused.
+    fn assert_not_paused(&self) {
+        assert!(!self.paused, "ERR_CONTRACT_PAUSED");
+    }
+
+    /// Assert not in a cross-contract call (reentrancy guard).
+    fn assert_not_locked(&self) {
+        assert!(!self.locked, "ERR_REENTRANCY");
+    }
+
+    /// Emergency pause — blocks all state-changing calls except unpause.
+    pub fn pause(&mut self, signature: String, expires_at: u64) {
+        self.verify_owner("pause", &signature, expires_at);
+        self.paused = true;
+        self.emit_event("contract_paused", serde_json::json!({}));
+        log!("Contract paused");
+    }
+
+    /// Unpause — restores normal operation.
+    pub fn unpause(&mut self, signature: String, expires_at: u64) {
+        self.verify_owner("unpause", &signature, expires_at);
+        self.paused = false;
+        self.emit_event("contract_unpaused", serde_json::json!({}));
+        log!("Contract unpaused");
+    }
+
+    /// Check if contract is paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused
     }
 
     // ── Wallet Storage Helpers (with migration) ──────────────────────
@@ -483,6 +518,8 @@ impl Contract {
             event_nonce: 0,
             owner_nonce: 0,
             wallet_names: Vector::new(StorageKey::WalletNames),
+            paused: false,
+            locked: false,
         }
     }
 
@@ -507,6 +544,7 @@ impl Contract {
 
     #[payable]
     pub fn create_wallet(&mut self, name: String, signature: String, expires_at: u64) {
+        self.assert_not_paused();
         self.verify_owner(&format!("create_wallet:{}", name), &signature, expires_at);
         let deposit = env::attached_deposit();
         assert!(
@@ -576,6 +614,7 @@ impl Contract {
     }
 
     pub fn delete_wallet(&mut self, name: String, signature: String, expires_at: u64) {
+        self.assert_not_paused();
         self.verify_owner(&format!("delete_wallet:{}", name), &signature, expires_at);
         let wallet = self.wallet_get(&name).expect("ERR_WALLET_NOT_FOUND");
 
@@ -621,6 +660,21 @@ impl Contract {
 
         self.wallet_remove(&name);
 
+        // Remove from wallet_names Vector (swap-remove)
+        let len = self.wallet_names.len();
+        let mut found_idx: Option<u64> = None;
+        for i in 0..len {
+            if let Some(n) = self.wallet_names.get(i) {
+                if n == name {
+                    found_idx = Some(i);
+                    break;
+                }
+            }
+        }
+        if let Some(idx) = found_idx {
+            self.wallet_names.swap_remove(idx);
+        }
+
         self.emit_event("wallet_deleted", serde_json::json!({
             "wallet": name,
             "storage_used": wallet.storage_used,
@@ -631,6 +685,7 @@ impl Contract {
     }
 
     pub fn transfer_ownership(&mut self, wallet_name: String, new_owner: AccountId, signature: String, expires_at: u64) {
+        self.assert_not_paused();
         self.verify_owner(&format!("transfer_ownership:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         assert_ne!(new_owner, wallet.owner, "ERR_ALREADY_OWNER");
@@ -687,6 +742,7 @@ impl Contract {
     /// Empty allowlist = accept all tokens.
     /// Once you add the first token, only listed tokens are accepted.
     pub fn add_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64) {
+        self.assert_not_paused();
         self.verify_owner(&format!("add_allowed_token:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         assert!(
@@ -706,6 +762,7 @@ impl Contract {
 
     /// Remove a token from the wallet's FT allowlist. Owner only.
     pub fn remove_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64) {
+        self.assert_not_paused();
         self.verify_owner(&format!("remove_allowed_token:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let original_len = wallet.allowed_tokens.len();
@@ -734,6 +791,7 @@ impl Contract {
         expires_at: u64,
         signature: String,
     ) {
+        self.assert_not_paused();
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let ikey = intent_key(&wallet_name, intent_index);
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
@@ -795,6 +853,7 @@ impl Contract {
         expires_at: u64,
         signature: String,
     ) {
+        self.assert_not_paused();
         let pkey = proposal_key(&wallet_name, proposal_id);
         let mut proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
 
@@ -840,6 +899,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_nostr_approver(
             wallet_name, proposal_id, approver_index, pubkey_hex, signature, expires_at, "approve",
         );
@@ -855,6 +915,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_nostr_approver(
             wallet_name, proposal_id, approver_index, pubkey_hex, signature, expires_at, "cancel",
         );
@@ -879,6 +940,7 @@ impl Contract {
         expires_at: u64,
         signature: String,
     ) {
+        self.assert_not_paused();
         // Verify owner signature for this action
         let action = format!("quick:{}:{}:{}", wallet_name, intent_index, &param_values.chars().take(64).collect::<String>());
         self.verify_owner(&action, &signature, expires_at);
@@ -947,6 +1009,7 @@ impl Contract {
     /// Payable: allows attached deposit for "deposit NEAR" intent executions.
     #[payable]
     pub fn execute(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64) {
+        self.assert_not_paused();
         self.verify_owner(&format!("execute:{}:{}", wallet_name, proposal_id), &signature, expires_at);
         self.execute_proposal(&wallet_name, proposal_id);
     }
@@ -1100,6 +1163,7 @@ impl Contract {
 
     /// Remove an executed/cancelled proposal to reclaim storage. Owner only.
     pub fn cleanup(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64) {
+        self.assert_not_paused();
         self.verify_owner(&format!("cleanup:{}:{}", wallet_name, proposal_id), &signature, expires_at);
 
         let pkey = proposal_key(&wallet_name, proposal_id);
@@ -1251,6 +1315,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_owner(&format!("set_call_receivers:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.call_allowed_receivers = receivers;
@@ -1267,6 +1332,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_owner(&format!("set_call_max_deposit:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.call_max_deposit = max_deposit.0;
@@ -1283,6 +1349,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_owner(&format!("set_daily_limit:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.daily_spend_limit = limit.0;
@@ -1299,6 +1366,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_owner(&format!("set_relayer_fee:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.relayer_fee = fee.0;
@@ -1315,6 +1383,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_owner(&format!("set_relayers:{}", wallet_name), &signature, expires_at);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.allowed_relayers = relayers;
@@ -1333,6 +1402,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_owner(&format!("activate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at);
         let ikey = intent_key(&wallet_name, intent_index);
         let mut intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
@@ -1350,6 +1420,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         self.verify_owner(&format!("deactivate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at);
         let ikey = intent_key(&wallet_name, intent_index);
         let mut intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
@@ -1372,6 +1443,7 @@ impl Contract {
         signature: String,
         expires_at: u64,
     ) {
+        self.assert_not_paused();
         let action = format!("batch:{}:{:?}", wallet_name, &proposal_ids);
         self.verify_owner(&action, &signature, expires_at);
 
@@ -1399,6 +1471,7 @@ impl Contract {
         from_id: u64,
         to_id: u64,
     ) -> u64 {
+        self.assert_not_paused();
         let wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let now = env::block_timestamp();
         let mut cleaned = 0u64;
@@ -1448,6 +1521,7 @@ impl Contract {
     }
 
     fn execute_transfer(&mut self, wallet_name: &String, params: &serde_json::Value) {
+        self.assert_not_locked();
         let amount_str = params["amount"].as_str()
             .map(String::from)
             .or_else(|| params["amount"].as_u64().map(|v| v.to_string()))
@@ -1468,6 +1542,7 @@ impl Contract {
             self.debit_ft(wallet_name, token_str, amount);
             // FT transfer: call ft_transfer on the token contract
             let token_account: AccountId = token_str.parse().expect("ERR_INVALID_TOKEN_ACCOUNT");
+            self.locked = true;
             let promise = Promise::new(token_account.clone()).function_call(
                 "ft_transfer".to_string(),
                 safe_json_ft_transfer(recipient.as_str(), &amount.to_string()),
@@ -1496,6 +1571,7 @@ impl Contract {
     }
 
     fn execute_call(&mut self, wallet_name: &String, params: &serde_json::Value) {
+        self.assert_not_locked();
         let receiver_id: AccountId = params["receiver_id"]
             .as_str().expect("ERR_MISSING_RECEIVER_ID")
             .parse().expect("ERR_INVALID_RECEIVER_ID");
@@ -1554,6 +1630,7 @@ impl Contract {
         }
 
         // Execute cross-contract call with callback to handle result
+        self.locked = true;
         let prepaid_gas = near_sdk::Gas::from_tgas(gas_tgas);
         let promise = Promise::new(receiver_id.clone()).function_call(
             method_name.clone(),
@@ -1596,6 +1673,7 @@ impl Contract {
             env::current_account_id(),
             "ERR_CALLBACK_ONLY"
         );
+        self.locked = false;
         // Check if the promise succeeded
         let result = env::promise_result(0u64);
         match result {
@@ -1636,6 +1714,7 @@ impl Contract {
             env::current_account_id(),
             "ERR_CALLBACK_ONLY"
         );
+        self.locked = false;
         let result = env::promise_result(0u64);
         match result {
             PromiseResult::Successful(_) => {
