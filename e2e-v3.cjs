@@ -27,7 +27,9 @@ const nowNs = () => BigInt(Date.now()) * 1_000_000n;
 // exactly — client and contract must build the identical signed string.
 const EXPIRY = (BigInt(Math.floor(Date.now() / 1000)) + 7200n) * 1_000_000_000n;
 const schnorrSign = (m, sk = NSEC) => bytesToHex(schnorr.sign(sha256(new TextEncoder().encode(m)), sk));
+let NONCE = 0;
 const ownerSig = (nonce, action) => schnorrSign(`expires ${EXPIRY}.000000000: ${action} | nonce: ${nonce} | contract: ${CONTRACT}`);
+const nonceSig = (action) => { const n = NONCE++; return { nonce: n, signature: ownerSig(n, action) }; };
 const fmt = (ns) => `${ns / 1_000_000_000n}.${String(ns % 1_000_000_000n).padStart(9, '0')}`;
 const pMsg = (i, action, content) => `expires ${fmt(EXPIRY)}: ${action} ${content} | wallet: treasury proposal: ${i} | contract: ${CONTRACT}`;
 const depHash = (def) => bytesToHex(sha256(new TextEncoder().encode(def)));
@@ -70,10 +72,8 @@ const rawArgs = (obj, big) => Buffer.from(JSON.stringify(
         log(`✅ ${label}`); return r;
       } catch (e) {
         const msg = (e.message || '') + (JSON.stringify(e) || '');
-        if (mustFail && attempt === 1) {
-          if (msg.includes(mustFail)) { log(`🛡️ ${label} → correctly rejected (${mustFail})`); return null; }
-          log(`❌ ${label} — expected ${mustFail}, got: ${msg.slice(0, 160)}`); process.exit(1);
-        }
+        if (mustFail && msg.includes(mustFail)) { log(`🛡️ ${label} → correctly rejected (${mustFail})`); return null; }
+        if (attempt === 1 && mustFail) { log(`❌ ${label} — expected ${mustFail}, got: ${msg.slice(0, 160)}`); process.exit(1); }
         if (/429|timeout|FetchError|ECONN/i.test(msg) && attempt === 0) { await new Promise(r => setTimeout(r, 3000)); continue; }
         const m = msg.match(/ERR_[A-Z_]+|panicked: [^"\\]+/) || [msg.slice(0, 160)];
         if (mustFail && m[0].includes(mustFail)) { log(`🛡️ ${label} → correctly rejected (${mustFail})`); return null; }
@@ -96,14 +96,14 @@ const rawArgs = (obj, big) => Buffer.from(JSON.stringify(
   };
 
   const STEP = parseInt(process.env.START || '0', 10);
-  let cur = 0; let NONCE = 0;
+  let cur = 0;
   const step = async (label, fn) => { const n = cur++; if (n < STEP) { log(`⏭️  ${label}`); return; } await fn(); };
   const nextNonce = () => NONCE++;
   const exec = (label, id, deposit = '0') => step(label, () => call(label, 'execute',
-    rawArgs({ wallet_name: 'treasury', proposal_id: id, signature: ownerSig(nextNonce(), `execute:treasury:${id}`), expires_at: EXPIRY.toString() }, ['expires_at']), { deposit }));
+    rawArgs({ wallet_name: 'treasury', proposal_id: id, ...nonceSig(`execute:treasury:${id}`), expires_at: EXPIRY.toString() }, ['expires_at']), { deposit }));
   const proposeApprove = async (nonceN, idx, label, intentIndex, paramValues, content) => {
     await step(`propose ${label}`, () => call(`propose ${label}`, 'propose',
-      rawArgs({ wallet_name: 'treasury', intent_index: intentIndex, param_values: JSON.stringify(paramValues), signature: ownerSig(nonceN, `propose:treasury:${idx}`), expires_at: EXPIRY.toString() }, ['expires_at'])));
+      rawArgs({ wallet_name: 'treasury', intent_index: intentIndex, param_values: JSON.stringify(paramValues), nonce: nonceN, signature: ownerSig(nonceN, `propose:treasury:${idx}`), expires_at: EXPIRY.toString() }, ['expires_at'])));
     await step(`verify+approve ${label}`, async () => {
       const stored = await view('get_proposal_message', { wallet_name: 'treasury', id: idx });
       const mine = pMsg(idx, 'propose', content);
@@ -117,33 +117,38 @@ const rawArgs = (obj, big) => Buffer.from(JSON.stringify(
 
   // nonce numbering plan (client-chosen; window is 64 wide from get_owner_nonce base):
   // n0 init-skip, n1 create_wallet, n2..: sequential as used below.
-  await step('init', () => call('init new([owner])', 'new', { owner_npubs: [NPubHex] }, { gas: 30n * 10n ** 12n }));
+  await step('init', () => call('init new([owner])', 'new', rawArgs({ owner_npubs: [NPubHex] }), { gas: 30n * 10n ** 12n }));
   NONCE = STEP > 1 ? 40 : 1; // on resume jump safely inside window past used slots
   await step('create_wallet', () => call('create_wallet(treasury, +0.5Ⓝ)', 'create_wallet',
-    rawArgs({ name: 'treasury', signature: ownerSig(nextNonce(), 'create_wallet:treasury'), expires_at: EXPIRY.toString() }, ['expires_at']),
+    rawArgs({ name: 'treasury', ...nonceSig('create_wallet:treasury'), expires_at: EXPIRY.toString() }, ['expires_at']),
     { deposit: yocto(0.5) }));
   await step('set guardian', () => call('set_guardian', 'set_guardian',
-    rawArgs({ npub: GPubHex, signature: ownerSig(nextNonce(), 'set_guardian'), expires_at: EXPIRY.toString() }, ['expires_at'])));
+    rawArgs({ npub: GPubHex, ...nonceSig('set_guardian'), expires_at: EXPIRY.toString() }, ['expires_at'])));
   await step('set relayer fee', () => call('set_relayer_fee(0.001Ⓝ)', 'set_relayer_fee',
-    rawArgs({ wallet_name: 'treasury', fee: yocto(0.001), signature: ownerSig(nextNonce(), 'set_relayer_fee:treasury'), expires_at: EXPIRY.toString() }, ['expires_at'])));
+    rawArgs({ wallet_name: 'treasury', fee: yocto(0.001), ...nonceSig('set_relayer_fee:treasury'), expires_at: EXPIRY.toString() }, ['expires_at'])));
 
   // SECURITY: replay a used nonce → must reject
-  await step('replay rejection', () => call('replay used nonce (n1)', 'set_relayer_fee',
-    rawArgs({ wallet_name: 'treasury', fee: '0', signature: ownerSig(1, 'set_relayer_fee:treasury'), expires_at: EXPIRY.toString() }, ['expires_at']),
-    { mustFail: 'ERR_NONCE_ALREADY_USED' }));
+  await step('replay rejection', async () => {
+    const nn = NONCE++;
+    await call(`burn nonce ${nn}`, 'set_relayer_fee',
+      rawArgs({ wallet_name: 'treasury', fee: yocto(0.001), nonce: nn, signature: ownerSig(nn, 'set_relayer_fee:treasury'), expires_at: EXPIRY.toString() }, ['expires_at']));
+    await call(`replay used nonce (${nn})`, 'set_relayer_fee',
+      rawArgs({ wallet_name: 'treasury', fee: '0', nonce: nn, signature: ownerSig(nn, 'set_relayer_fee:treasury'), expires_at: EXPIRY.toString() }, ['expires_at']),
+      { mustFail: 'ERR_NONCE_ALREADY_USED' });
+  });
   // SECURITY: far-future nonce outside window → must reject
   await step('window rejection', () => call('nonce outside window', 'set_relayer_fee',
-    rawArgs({ wallet_name: 'treasury', fee: '0', signature: ownerSig(nextNonce() + 64, 'set_relayer_fee:treasury'), expires_at: EXPIRY.toString() }, ['expires_at']),
+    rawArgs({ wallet_name: 'treasury', fee: '0', nonce: NONCE + 64, signature: ownerSig(NONCE + 64, 'set_relayer_fee:treasury'), expires_at: EXPIRY.toString() }, ['expires_at']),
     { mustFail: 'ERR_NONCE_WINDOW_EXCEEDED' }));
 
   // guardian pause / unpause
   await step('guardian pause', () => call('guardian pause', 'pause',
-    { signature: schnorrSign(`expires ${EXPIRY}.000000000: pause | contract: ${CONTRACT}`, GSEC), expires_at: EXPIRY.toString() }));
+    rawArgs({ signature: schnorrSign(`expires ${EXPIRY}.000000000: pause | contract: ${CONTRACT}`, GSEC), expires_at: EXPIRY.toString() }, ['expires_at'])));
   await step('paused blocks propose', () => call('propose while paused', 'propose',
-    rawArgs({ wallet_name: 'treasury', intent_index: 0, param_values: '{}', signature: ownerSig(nextNonce(), 'propose:treasury:99'), expires_at: EXPIRY.toString() }, ['expires_at']),
+    rawArgs({ wallet_name: 'treasury', intent_index: 0, param_values: '{}', ...nonceSig('propose:treasury:99'), expires_at: EXPIRY.toString() }, ['expires_at']),
     { mustFail: 'ERR_CONTRACT_PAUSED' }));
   await step('owner unpause', () => call('unpause', 'unpause',
-    rawArgs({ signature: ownerSig(nextNonce(), 'unpause'), expires_at: EXPIRY.toString() }, ['expires_at'])));
+    rawArgs({ ...nonceSig('unpause'), expires_at: EXPIRY.toString() }, ['expires_at'])));
 
   await proposeApprove(nextNonce(), 0, 'AddIntent(Deposit)', 0,
     { hash: depHash(depositIntent), definition: depositIntent }, `add intent definition_hash: ${depHash(depositIntent)}`);
@@ -155,12 +160,12 @@ const rawArgs = (obj, big) => Buffer.from(JSON.stringify(
 
   // SECURITY: transfer with empty wallet → must reject (insufficient)
   await step('insufficient transfer rejection', () => call('transfer w/ 0 balance', 'execute',
-    rawArgs({ wallet_name: 'treasury', proposal_id: 999, signature: ownerSig(nextNonce(), 'execute:treasury:999'), expires_at: EXPIRY.toString() }, ['expires_at']),
+    rawArgs({ wallet_name: 'treasury', proposal_id: 999, ...nonceSig('execute:treasury:999'), expires_at: EXPIRY.toString() }, ['expires_at']),
     { mustFail: 'ERR_PROPOSAL_NOT_FOUND' }));
 
   // fund wallet via Deposit intent (intent #3)
   await step('propose Deposit 1Ⓝ', () => call('propose Deposit 1Ⓝ', 'propose',
-    rawArgs({ wallet_name: 'treasury', intent_index: 3, param_values: JSON.stringify({ amount: yocto(1) }), signature: ownerSig(nextNonce(), 'propose:treasury:2'), expires_at: EXPIRY.toString() }, ['expires_at'])));
+    rawArgs({ wallet_name: 'treasury', intent_index: 3, param_values: JSON.stringify({ amount: yocto(1) }), ...nonceSig('propose:treasury:2'), expires_at: EXPIRY.toString() }, ['expires_at'])));
   await step('approve Deposit', () => call('nostr approve Deposit', 'approve',
     rawArgs({ wallet_name: 'treasury', proposal_id: 2, approver_index: 0, pubkey_hex: NPubHex, signature: schnorrSign(pMsg(2, 'approve', 'deposit NEAR to wallet')), expires_at: EXPIRY.toString() }, ['expires_at'])));
   await exec('execute Deposit (+1Ⓝ)', 2, yocto(1));

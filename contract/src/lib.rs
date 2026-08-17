@@ -407,18 +407,21 @@ fn safe_json_ft_transfer(recipient: &str, amount: &str) -> Vec<u8> {
 #[borsh(crate = "near_sdk::borsh")]
 #[near_bindgen]
 pub struct Contract {
-    /// Nostr npub hex (32-byte x-only public key) of the contract owner.
-    /// All admin actions require a schnorr signature from this key.
     /// Contract version for migration tracking.
     version: u32,
-    owner_npub: String,
+    /// Owner nostr npubs (hex). Any owner key can authorize owner actions.
+    owner_npubs: Vec<String>,
+    /// Optional guardian npub — may ONLY pause the contract.
+    guardian_npub: Option<String>,
     wallets: LookupMap<String, Wallet>,
     intents: LookupMap<String, Intent>,
     proposals: LookupMap<String, Proposal>,
     delegations: LookupMap<String, AccountId>,
     event_nonce: u64,
-    /// Monotonic counter for replay protection. Each owner action increments this.
+    /// Window base for owner nonce replay protection.
     owner_nonce: u64,
+    /// Bitmap of consumed nonces within [owner_nonce, owner_nonce+64).
+    owner_nonce_bitmap: u64,
     /// Ordered list of wallet names for enumeration.
     wallet_names: Vector<String>,
     /// Emergency pause flag — when true, only unpause() works.
@@ -447,16 +450,26 @@ impl Contract {
     }
 
     /// Emergency pause — blocks all state-changing calls except unpause.
+    /// Authorized by ANY owner npub OR the guardian npub (guardian can only pause).
     pub fn pause(&mut self, signature: String, expires_at: u64) {
-        self.verify_owner("pause", &signature, expires_at);
+        assert!(expires_at > env::block_timestamp(), "ERR_SIG_EXPIRED");
+        let msg = format!(
+            "expires {}.000000000: pause | contract: {}",
+            expires_at, env::current_account_id()
+        );
+        let is_owner = self.owner_npubs.iter()
+            .any(|pk| message::try_schnorr_verify(pk, &signature, &msg));
+        let is_guardian = self.guardian_npub.as_deref()
+            .map_or(false, |g| message::try_schnorr_verify(g, &signature, &msg));
+        assert!(is_owner || is_guardian, "ERR_NOT_AUTHORIZED_TO_PAUSE");
         self.paused = true;
         self.emit_event("contract_paused", serde_json::json!({}));
         log!("Contract paused");
     }
 
     /// Unpause — restores normal operation.
-    pub fn unpause(&mut self, signature: String, expires_at: u64) {
-        self.verify_owner("unpause", &signature, expires_at);
+    pub fn unpause(&mut self, signature: String, expires_at: u64, nonce: u64) {
+        self.verify_owner("unpause", &signature, expires_at, nonce);
         self.paused = false;
         self.emit_event("contract_unpaused", serde_json::json!({}));
         log!("Contract unpaused");
@@ -515,46 +528,68 @@ impl Contract {
     /// Initialize with the nostr npub of the owner.
     /// The owner controls everything — create wallets, add intents, propose.
     #[init]
-    pub fn new(owner_npub: String) -> Self {
-        assert!(!owner_npub.is_empty(), "ERR_EMPTY_OWNER_NPUB");
+    pub fn new(owner_npubs: Vec<String>) -> Self {
+        assert!(!owner_npubs.is_empty(), "ERR_EMPTY_OWNERS");
+        assert!(owner_npubs.len() <= 8, "ERR_TOO_MANY_OWNERS: max 8");
+        for np in &owner_npubs {
+            assert!(np.len() == 64, "ERR_INVALID_NPUB_LEN: expected 64 hex chars");
+            assert!(np.chars().all(|c| c.is_ascii_hexdigit()), "ERR_INVALID_NPUB_HEX");
+        }
         Self {
-            version: 2,
-            owner_npub,
+            version: 3,
+            owner_npubs,
+            guardian_npub: None,
             wallets: LookupMap::new(StorageKey::Wallets),
             intents: LookupMap::new(StorageKey::Intents),
             proposals: LookupMap::new(StorageKey::Proposals),
             delegations: LookupMap::new(StorageKey::Delegations),
             event_nonce: 0,
             owner_nonce: 0,
+            owner_nonce_bitmap: 0,
             wallet_names: Vector::new(StorageKey::WalletNames),
             paused: false,
             locked: false,
         }
     }
 
-    /// Verify the caller is the nostr owner via schnorr signature.
-    fn verify_owner(&mut self, action: &str, signature: &str, expires_at: u64) {
+    /// Verify the caller is an owner via schnorr signature over
+    /// `expires {ts}.000000000: {action} | nonce: {n} | contract: {account_id}`.
+    /// Binds the signature to THIS contract account (anti cross-contract replay)
+    /// and to a client-chosen nonce inside a 64-slot sliding window (safe for
+    /// concurrent relayers).
+    fn verify_owner(&mut self, action: &str, signature: &str, expires_at: u64, nonce: u64) {
         assert!(expires_at > env::block_timestamp(), "ERR_SIG_EXPIRED");
-        let nonce = self.owner_nonce;
-        let msg = format!("expires {}.000000000: {} | nonce: {} | contract: owner", expires_at, action, nonce);
-        message::verify_schnorr_signature(&self.owner_npub, signature, &msg);
-        self.owner_nonce += 1;
+        let msg = format!(
+            "expires {}.000000000: {} | nonce: {} | contract: {}",
+            expires_at, action, nonce, env::current_account_id()
+        );
+        let valid = self.owner_npubs.iter()
+            .any(|pk| message::try_schnorr_verify(pk, signature, &msg));
+        assert!(valid, "ERR_INVALID_OWNER_SIGNATURE");
+        self.consume_nonce(nonce);
     }
 
-    /// Verify owner without consuming nonce (for read-only checks or backward compat)
-    #[allow(dead_code)]
-    fn verify_owner_readonly(&self, action: &str, signature: &str, expires_at: u64) {
-        assert!(expires_at > env::block_timestamp(), "ERR_SIG_EXPIRED");
-        let msg = format!("expires {}.000000000: {} | contract: owner", expires_at, action);
-        message::verify_schnorr_signature(&self.owner_npub, signature, &msg);
+    /// Sliding 64-slot nonce window: any unused nonce in
+    /// [owner_nonce, owner_nonce+64) is accepted; the window slides forward
+    /// as low nonces are consumed. Prevents both replay and concurrent-tx races.
+    fn consume_nonce(&mut self, nonce: u64) {
+        assert!(nonce >= self.owner_nonce, "ERR_NONCE_TOO_LOW");
+        assert!(nonce < self.owner_nonce + 64, "ERR_NONCE_WINDOW_EXCEEDED");
+        let bit = 1u64 << (nonce - self.owner_nonce);
+        assert!(self.owner_nonce_bitmap & bit == 0, "ERR_NONCE_ALREADY_USED");
+        self.owner_nonce_bitmap |= bit;
+        while self.owner_nonce_bitmap & 1 != 0 {
+            self.owner_nonce += 1;
+            self.owner_nonce_bitmap >>= 1;
+        }
     }
 
     // ── Wallet Management ──────────────────────────────────────────────
 
     #[payable]
-    pub fn create_wallet(&mut self, name: String, signature: String, expires_at: u64) {
+    pub fn create_wallet(&mut self, name: String, signature: String, expires_at: u64, nonce: u64) {
         self.assert_not_paused();
-        self.verify_owner(&format!("create_wallet:{}", name), &signature, expires_at);
+        self.verify_owner(&format!("create_wallet:{}", name), &signature, expires_at, nonce);
         let deposit = env::attached_deposit();
         assert!(
             deposit.as_yoctonear() >= STORAGE_DEPOSIT_YOCTO,
@@ -571,7 +606,7 @@ impl Contract {
             "ERR_NAME_INVALID_CHARS"
         );
 
-        let owner_display = self.owner_npub.clone();
+        let owner_display = self.owner_npubs.first().cloned().unwrap_or_default();
         let initial_storage = env::storage_usage();
         let wallet = Wallet {
             name: name.clone(),
@@ -622,9 +657,9 @@ impl Contract {
         true
     }
 
-    pub fn delete_wallet(&mut self, name: String, signature: String, expires_at: u64) {
+    pub fn delete_wallet(&mut self, name: String, signature: String, expires_at: u64, nonce: u64) {
         self.assert_not_paused();
-        self.verify_owner(&format!("delete_wallet:{}", name), &signature, expires_at);
+        self.verify_owner(&format!("delete_wallet:{}", name), &signature, expires_at, nonce);
         let wallet = self.wallet_get(&name).expect("ERR_WALLET_NOT_FOUND");
 
         for i in 0..wallet.intent_index {
@@ -693,9 +728,9 @@ impl Contract {
         log!("Wallet '{}' deleted (refunded {} yocto)", name, refund);
     }
 
-    pub fn transfer_ownership(&mut self, wallet_name: String, new_owner: AccountId, signature: String, expires_at: u64) {
+    pub fn transfer_ownership(&mut self, wallet_name: String, new_owner: AccountId, signature: String, expires_at: u64, nonce: u64) {
         self.assert_not_paused();
-        self.verify_owner(&format!("transfer_ownership:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("transfer_ownership:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         assert_ne!(new_owner, wallet.owner, "ERR_ALREADY_OWNER");
 
@@ -725,24 +760,59 @@ impl Contract {
         log!("Ownership of '{}' transferred to {}", wallet_name, new_owner);
     }
 
-    /// Rotate the contract owner's nostr key. Requires signature from the CURRENT nsec.
-    /// After rotation, the new npub is used for all owner verification.
-    pub fn rotate_owner_key(&mut self, new_npub: String, signature: String, expires_at: u64) {
-        assert!(!new_npub.is_empty(), "ERR_EMPTY_NPUB");
+    /// Add an owner npub (requires an existing owner signature).
+    pub fn add_owner_npub(&mut self, new_npub: String, signature: String, expires_at: u64, nonce: u64) {
         assert!(new_npub.len() == 64, "ERR_INVALID_NPUB_LEN: expected 64 hex chars");
-        self.verify_owner("rotate_owner_key", &signature, expires_at);
-        let old_npub = self.owner_npub.clone();
-        self.owner_npub = new_npub.clone();
-        self.emit_event("owner_key_rotated", serde_json::json!({
-            "old_npub": old_npub,
-            "new_npub": new_npub,
-        }));
-        log!("Owner key rotated: {} -> {}", old_npub, &new_npub[..16]);
+        assert!(new_npub.chars().all(|c| c.is_ascii_hexdigit()), "ERR_INVALID_NPUB_HEX");
+        self.verify_owner("add_owner_npub", &signature, expires_at, nonce);
+        assert!(!self.owner_npubs.contains(&new_npub), "ERR_OWNER_ALREADY_PRESENT");
+        assert!(self.owner_npubs.len() < 8, "ERR_TOO_MANY_OWNERS: max 8");
+        self.owner_npubs.push(new_npub.clone());
+        self.emit_event("owner_added", serde_json::json!({ "new_npub": new_npub }));
+        log!("Owner npub added: {}", &new_npub[..16]);
     }
 
-    /// Get the current owner nonce (for clients to include in signatures)
+    /// Remove an owner npub. The last owner cannot be removed.
+    pub fn remove_owner_npub(&mut self, npub: String, signature: String, expires_at: u64, nonce: u64) {
+        self.verify_owner("remove_owner_npub", &signature, expires_at, nonce);
+        assert!(self.owner_npubs.len() > 1, "ERR_LAST_OWNER: cannot remove the final owner");
+        let before = self.owner_npubs.len();
+        self.owner_npubs.retain(|p| p != &npub);
+        assert!(self.owner_npubs.len() < before, "ERR_OWNER_NOT_FOUND");
+        self.emit_event("owner_removed", serde_json::json!({ "npub": npub }));
+        log!("Owner npub removed: {}", &npub[..16]);
+    }
+
+    /// Set (or clear with None) the guardian npub. Guardian may ONLY pause.
+    pub fn set_guardian(&mut self, npub: Option<String>, signature: String, expires_at: u64, nonce: u64) {
+        if let Some(ref n) = npub {
+            assert!(n.len() == 64, "ERR_INVALID_NPUB_LEN: expected 64 hex chars");
+            assert!(n.chars().all(|c| c.is_ascii_hexdigit()), "ERR_INVALID_NPUB_HEX");
+        }
+        self.verify_owner("set_guardian", &signature, expires_at, nonce);
+        self.guardian_npub = npub.clone();
+        self.emit_event("guardian_set", serde_json::json!({ "guardian_npub": npub }));
+    }
+
+    /// Get the owner nonce window base (for clients to pick a nonce in [base, base+64))
     pub fn get_owner_nonce(&self) -> u64 {
         self.owner_nonce
+    }
+
+    /// Get the consumed-nonce bitmap within the current window.
+    pub fn get_owner_nonce_bitmap(&self) -> u64 {
+        self.owner_nonce_bitmap
+    }
+
+
+    /// Get all owner npubs.
+    pub fn get_owner_npubs(&self) -> Vec<String> {
+        self.owner_npubs.clone()
+    }
+
+    /// Get the guardian npub, if set.
+    pub fn get_guardian_npub(&self) -> Option<String> {
+        self.guardian_npub.clone()
     }
 
     // ── Intent Management ──────────────────────────────────────────────
@@ -750,9 +820,9 @@ impl Contract {
     /// Add a token to the wallet's FT allowlist. Owner only.
     /// Empty allowlist = accept all tokens.
     /// Once you add the first token, only listed tokens are accepted.
-    pub fn add_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64) {
+    pub fn add_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64, nonce: u64) {
         self.assert_not_paused();
-        self.verify_owner(&format!("add_allowed_token:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("add_allowed_token:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         assert!(
             !wallet.allowed_tokens.contains(&token),
@@ -770,9 +840,9 @@ impl Contract {
     }
 
     /// Remove a token from the wallet's FT allowlist. Owner only.
-    pub fn remove_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64) {
+    pub fn remove_allowed_token(&mut self, wallet_name: String, token: AccountId, signature: String, expires_at: u64, nonce: u64) {
         self.assert_not_paused();
-        self.verify_owner(&format!("remove_allowed_token:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("remove_allowed_token:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let original_len = wallet.allowed_tokens.len();
         wallet.allowed_tokens.retain(|t| t != &token);
@@ -798,6 +868,7 @@ impl Contract {
         intent_index: u32,
         param_values: String,
         expires_at: u64,
+        nonce: u64,
         signature: String,
     ) {
         self.assert_not_paused();
@@ -817,7 +888,7 @@ impl Contract {
         let msg = message::build_message(&wallet_name, proposal_index, expires_at, "propose", &intent, &params);
 
         // Verify nostr owner signature
-        self.verify_owner(&format!("propose:{}:{}", wallet_name, proposal_index), &signature, expires_at);
+        self.verify_owner(&format!("propose:{}:{}", wallet_name, proposal_index), &signature, expires_at, nonce);
 
         let proposal = Proposal {
             id: proposal_index,
@@ -860,6 +931,7 @@ impl Contract {
         proposal_id: u64,
         param_values: String,
         expires_at: u64,
+        nonce: u64,
         signature: String,
     ) {
         self.assert_not_paused();
@@ -880,7 +952,7 @@ impl Contract {
         let msg = message::build_message(&wallet_name, proposal_id, expires_at, "amend", &intent, &params);
 
         // Verify nostr owner signature
-        self.verify_owner(&format!("amend:{}:{}", wallet_name, proposal_id), &signature, expires_at);
+        self.verify_owner(&format!("amend:{}:{}", wallet_name, proposal_id), &signature, expires_at, nonce);
 
         proposal.reset_votes();
         proposal.param_values = param_values;
@@ -947,12 +1019,13 @@ impl Contract {
         intent_index: u32,
         param_values: String,
         expires_at: u64,
+        nonce: u64,
         signature: String,
     ) {
         self.assert_not_paused();
         // Verify owner signature for this action
         let action = format!("quick:{}:{}:{}", wallet_name, intent_index, &param_values.chars().take(64).collect::<String>());
-        self.verify_owner(&action, &signature, expires_at);
+        self.verify_owner(&action, &signature, expires_at, nonce);
 
         let ikey = intent_key(&wallet_name, intent_index);
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
@@ -965,7 +1038,7 @@ impl Contract {
         assert!(owner_is_proposer, "ERR_NOT_PROPOSER: caller not in intent proposers");
 
         // Check owner is in nostr_approvers
-        let owner_is_approver = intent.nostr_approvers.iter().any(|p| p == &self.owner_npub);
+        let owner_is_approver = intent.nostr_approvers.iter().any(|p| self.owner_npubs.contains(p));
         assert!(owner_is_approver, "ERR_OWNER_NOT_APPROVER: owner must be in nostr_approvers");
 
         // Validate params
@@ -1022,9 +1095,9 @@ impl Contract {
     /// Execute an approved proposal. Requires owner nostr signature.
     /// Payable: allows attached deposit for "deposit NEAR" intent executions.
     #[payable]
-    pub fn execute(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64) {
+    pub fn execute(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64, nonce: u64) {
         self.assert_not_paused();
-        self.verify_owner(&format!("execute:{}:{}", wallet_name, proposal_id), &signature, expires_at);
+        self.verify_owner(&format!("execute:{}:{}", wallet_name, proposal_id), &signature, expires_at, nonce);
         self.execute_proposal(&wallet_name, proposal_id);
     }
 
@@ -1171,15 +1244,35 @@ impl Contract {
         let mut intent_mut = intent.clone();
         intent_mut.active_proposal_count = intent_mut.active_proposal_count.saturating_sub(1);
         self.intents.insert(&ikey, &intent_mut);
+
+        // ── Relayer payout: reward the tx submitter from wallet balance ──
+        // (gas + service fee). Only if the relayer is allowed and a fee is set.
+        let relayer = env::predecessor_account_id();
+        if relayer != env::current_account_id() {
+            if let Some(mut wallet) = self.wallet_get_readonly(wallet_name) {
+                if wallet.is_relayer_allowed(&relayer) && wallet.relayer_fee > 0 {
+                    let bal = self.get_wallet_near_balance(wallet_name.clone()).0;
+                    let payout = wallet.relayer_fee.min(bal);
+                    if payout > 0 {
+                        self.debit_near(wallet_name, payout);
+                        wallet.storage_used = wallet.storage_used; // no-op keep borrow
+                        Promise::new(relayer.clone()).transfer(near_sdk::NearToken::from_yoctonear(payout));
+                        log!("Relayer fee paid: {} yoctoNEAR to {}", payout, relayer);
+                    }
+                }
+                let _ = &mut wallet;
+            }
+        }
+
         self.emit_event("proposal_executed", serde_json::json!({
             "wallet": wallet_name, "proposal_id": proposal_id,
         }));
     }
 
     /// Remove an executed/cancelled proposal to reclaim storage. Owner only.
-    pub fn cleanup(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64) {
+    pub fn cleanup(&mut self, wallet_name: String, proposal_id: u64, signature: String, expires_at: u64, nonce: u64) {
         self.assert_not_paused();
-        self.verify_owner(&format!("cleanup:{}:{}", wallet_name, proposal_id), &signature, expires_at);
+        self.verify_owner(&format!("cleanup:{}:{}", wallet_name, proposal_id), &signature, expires_at, nonce);
 
         let pkey = proposal_key(&wallet_name, proposal_id);
         let proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
@@ -1283,8 +1376,27 @@ impl Contract {
                 .collect()
         };
 
+        // serde_json cannot serialize raw u128 — stringify the wallet fields.
+        let wallet_json = serde_json::json!({
+            "name": wallet.name,
+            "owner": wallet.owner,
+            "proposal_index": wallet.proposal_index,
+            "intent_index": wallet.intent_index,
+            "created_at": wallet.created_at,
+            "storage_deposit": wallet.storage_deposit.to_string(),
+            "storage_used": wallet.storage_used,
+            "allowed_tokens": wallet.allowed_tokens,
+            "ft_token_count": wallet.ft_token_count,
+            "call_allowed_receivers": wallet.call_allowed_receivers,
+            "call_max_deposit": wallet.call_max_deposit.to_string(),
+            "daily_spend_limit": wallet.daily_spend_limit.to_string(),
+            "daily_spend_reset_at": wallet.daily_spend_reset_at,
+            "daily_spend_used": wallet.daily_spend_used.to_string(),
+            "relayer_fee": wallet.relayer_fee.to_string(),
+            "allowed_relayers": wallet.allowed_relayers,
+        });
         serde_json::json!({
-            "wallet": wallet,
+            "wallet": wallet_json,
             "intents": intents,
             "near_balance": near_balance.to_string(),
             "recent_proposals": proposals,
@@ -1333,9 +1445,10 @@ impl Contract {
         receivers: Vec<AccountId>,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
-        self.verify_owner(&format!("set_call_receivers:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("set_call_receivers:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.call_allowed_receivers = receivers;
         self.wallet_insert(&wallet_name, &wallet);
@@ -1350,9 +1463,10 @@ impl Contract {
         max_deposit: U128,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
-        self.verify_owner(&format!("set_call_max_deposit:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("set_call_max_deposit:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.call_max_deposit = max_deposit.0;
         self.wallet_insert(&wallet_name, &wallet);
@@ -1367,9 +1481,10 @@ impl Contract {
         limit: U128,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
-        self.verify_owner(&format!("set_daily_limit:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("set_daily_limit:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.daily_spend_limit = limit.0;
         self.wallet_insert(&wallet_name, &wallet);
@@ -1384,9 +1499,10 @@ impl Contract {
         fee: U128,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
-        self.verify_owner(&format!("set_relayer_fee:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("set_relayer_fee:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.relayer_fee = fee.0;
         self.wallet_insert(&wallet_name, &wallet);
@@ -1401,9 +1517,10 @@ impl Contract {
         relayers: Vec<AccountId>,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
-        self.verify_owner(&format!("set_relayers:{}", wallet_name), &signature, expires_at);
+        self.verify_owner(&format!("set_relayers:{}", wallet_name), &signature, expires_at, nonce);
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         wallet.allowed_relayers = relayers;
         self.wallet_insert(&wallet_name, &wallet);
@@ -1420,9 +1537,10 @@ impl Contract {
         intent_index: u32,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
-        self.verify_owner(&format!("activate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at);
+        self.verify_owner(&format!("activate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at, nonce);
         let ikey = intent_key(&wallet_name, intent_index);
         let mut intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
         intent.active = true;
@@ -1438,9 +1556,10 @@ impl Contract {
         intent_index: u32,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
-        self.verify_owner(&format!("deactivate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at);
+        self.verify_owner(&format!("deactivate_intent:{}:{}", wallet_name, intent_index), &signature, expires_at, nonce);
         let ikey = intent_key(&wallet_name, intent_index);
         let mut intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
         assert!(intent.active_proposal_count == 0, "ERR_HAS_ACTIVE_PROPOSALS");
@@ -1461,10 +1580,11 @@ impl Contract {
         proposal_ids: Vec<u64>,
         signature: String,
         expires_at: u64,
+        nonce: u64,
     ) {
         self.assert_not_paused();
         let action = format!("batch:{}:{:?}", wallet_name, &proposal_ids);
-        self.verify_owner(&action, &signature, expires_at);
+        self.verify_owner(&action, &signature, expires_at, nonce);
 
         assert!(!proposal_ids.is_empty(), "ERR_EMPTY_BATCH");
         assert!(proposal_ids.len() <= 10, "ERR_BATCH_TOO_LARGE: max 10");
@@ -1868,7 +1988,7 @@ impl Contract {
     }
 
     fn create_meta_intents(&mut self, name: &str, owner: &AccountId) {
-        let owner_npub = self.owner_npub.clone();
+        let owner_npub = self.owner_npubs.first().cloned().unwrap_or_default();
         let make = |index: u32, itype: IntentType, iname: &str, template: &str, params: Vec<ParamDef>| Intent {
             wallet_name: name.to_string(),
             index,
