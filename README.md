@@ -18,15 +18,85 @@ Traditional multisigs have signers approve hashes of serialized transactions. **
 ### Message Format
 
 ```
-expires <timestamp>: <action> <content> | wallet: <name> proposal: <index>
+expires <timestamp>: <action> <content> | wallet: <name> proposal: <index> | contract: <account_id>
 ```
 
 Example:
 ```
-expires 1893456000.000000000: propose transfer 1000000000000000000000000 yoctoNEAR to bob.near | wallet: treasury proposal: 0
+expires 1893456000.000000000: propose transfer 1000000000000000000000000 yoctoNEAR to bob.near | wallet: treasury proposal: 0 | contract: msig.example.testnet
 ```
 
 No ambiguity. Signers know exactly what they're approving.
+
+## v3 Security Upgrade
+
+v3 hardens the owner (nostr) signature path. The unit tests (`cd contract && cargo test`) and the on-chain e2e (`node e2e-v3.cjs`) both pass green.
+
+### Multi-owner npub set
+
+`new(owner_npubs: Vec<String>)` initializes a **set** of owner npubs (32-byte x-only pubkey, hex-encoded). Any owner key can authorize owner actions; owners can be added/removed via signed `add_owner_npub` / `remove_owner_npub` calls. The signing keys are BIP-340 schnorr keys — same curve/format as Nostr (the client signs `sha256(message)` with a secp256k1 schnorr key).
+
+### Guardian pause
+
+An optional **guardian npub** (`set_guardian`) may pause the contract (`pause`), blocking every state-changing call except `unpause`. The guardian can **only** pause — it cannot move funds or change config. Pause/unpause are clear-signed:
+
+```
+expires {expires_at}.000000000: pause | contract: {account_id}
+```
+
+### Anti-replay: contract-id binding + nonce window
+
+Every signed message now ends with `| contract: {account_id}`, so a signature for one deployment is useless on another contract (or another chain). Owner-action messages additionally carry a client-chosen nonce:
+
+```
+expires {expires_at}.000000000: {action} | nonce: {nonce} | contract: {account_id}
+```
+
+- Owner nonces use a **64-slot sliding window**: any *unused* nonce in `[get_owner_nonce(), get_owner_nonce()+64)` is accepted. Consumed nonces are tracked in a bitmap; the window base slides forward only across contiguous consumed nonces, so gaps intentionally pin the base (skipped low nonces remain usable later).
+- Replaying a used nonce → `ERR_NONCE_ALREADY_USED`; a nonce outside the window → `ERR_NONCE_WINDOW_EXCEEDED`.
+- Failed receipts revert nonce consumption (NEAR rollback), so a rejected tx never burns a nonce. Clients should use mostly-contiguous nonces to keep the window moving.
+- Proposal-flow messages are bound per-proposal instead (proposal index + expiry + contract id) — no nonce needed for `approve`.
+
+### Relayer payout
+
+Each wallet can set a `relayer_fee` (and optional relayer allowlist). On execution, if the transaction submitter is an allowed relayer (and not the contract itself), the fee is paid out of the wallet's NEAR balance — rewarding gas-paying relayers.
+
+### Client message formats (must match exactly)
+
+Owner actions (create_wallet, set_guardian, set_relayer_fee, propose, execute, unpause, …):
+```
+expires {expires_at}.000000000: {action} | nonce: {nonce} | contract: {account_id}
+```
+
+Proposals (via `get_proposal_message` / `build_message`):
+```
+expires {expires_at}.000000000: {action} {content} | wallet: {wallet} proposal: {idx} | contract: {account_id}
+```
+
+Proposal content: transfers → `transfer {amount} to {recipient}`; add-intent → `add intent definition_hash: {sha256_hex_of_intent_json}`; deposit → `deposit NEAR to wallet`.
+
+Use whole-second expiry — `(floor(now/1000)+7200)*1e9` as a NUMBER — so the `u64` survives the JSON double round-trip exactly.
+
+Signing (JS): `schnorr.sign(sha256(new TextEncoder().encode(msg)), nsec)` with `@noble/curves` secp256k1. Note noble v1.x `verify()` argument order is `(signature, message, pubkey)` — signature first.
+
+### End-to-end test
+
+```bash
+node e2e-v3.cjs          # full flow on nmsig.vault.kampy.testnet
+START=4 node e2e-v3.cjs  # resume from step 4 (skips the first 4 steps)
+```
+
+Covers: multi-owner init, wallet creation, AddIntent(Deposit/Transfer) propose→approve→execute, deposits, 0.5Ⓝ transfer, replay-nonce rejection, out-of-window nonce rejection, guardian pause/unpause, and relayer fee config.
+
+### ⚠️ near CLI artifact-cache gotcha
+
+`near-cli-rs` (v2m0) caches compiled wasm at `~/.near-cli/artifacts/<account>.wasm` and can **silently deploy stale wasm** with `near contract deploy use-file`. Always verify the on-chain `code_hash` against your local file's sha256 after deploying. `deploy2.cjs` does this:
+
+```bash
+node deploy2.cjs <account-id> <path/to/contract.wasm>
+# writes result (incl. hash match) to /tmp/deploy_result.txt
+```
+
 
 ## Features
 
@@ -282,6 +352,9 @@ Placeholders `{param_name}` are replaced with parameter values:
 - Unauthorized cancellations (clear-signed)
 - FT griefing (token allowlist + storage accounting)
 - Owner bypass (no `add_intent`, all through governance)
+- Owner-signature replay across contracts (v3 contract-id binding)
+- Owner-signature replay across time (v3 64-slot nonce window)
+- Stuck/dangerous states (v3 guardian pause)
 
 ### Trust assumptions
 
@@ -308,7 +381,16 @@ cd contract
 cargo near build non-reproducible-wasm
 ```
 
-Output: `target/near/clear_msig.wasm` (~200KB)
+Output: `target/near/clear_msig.wasm` (~630KB)
+
+**Toolchain note:** newer default rustc (≥1.87) makes `cargo-near` abort with *"wasm compiled with 1.87.0 or newer rust toolchain is currently not compatible with nearcore VM"*. Build with a pinned toolchain instead:
+
+```bash
+cd contract
+cargo +1.86.0 near build non-reproducible-wasm
+```
+
+(Build from `contract/` — the workspace root fails.) A ~630KB wasm needs **~7+ NEAR** on the contract account for storage staking; fund accordingly before deploying.
 
 ### Deploy (Fresh)
 
@@ -317,12 +399,14 @@ Output: `target/near/clear_msig.wasm` (~200KB)
 near account create-account fund-myself <contract-id> '5 NEAR' \
   sign-as <your-account> network-config testnet sign-with-keychain send
 
-# 2. Deploy contract code
+# 2. Deploy contract code — then VERIFY the code hash (near CLI artifact cache!)
 near contract deploy <contract-id> use-file target/near/clear_msig.wasm \
   without-init-call network-config testnet sign-with-keychain send
+# or, hash-verified:  node deploy2.cjs <contract-id> target/near/clear_msig/clear_msig.wasm
 
-# 3. Initialize
-near call <contract-id> new --accountId <your-account> --networkId testnet
+# 3. Initialize (v3: pass the owner npub set)
+near call <contract-id> new --accountId <your-account> --networkId testnet \
+  --args '{"owner_npubs": ["<64-char-hex-npub>"]}'
 ```
 
 ### Deploy (Upgrade)
