@@ -1,0 +1,25 @@
+{
+  "orphanDrain": {
+    "leftover": 0.0039
+  },
+  "methods": {
+    "owner": [
+      "submit_action",
+      "session_ping",
+      "propose",
+      "approve",
+      "execute"
+    ],
+    "agent": [
+      "approve",
+      "session_ping"
+    ]
+  },
+  "flagship": {
+    "transferred": 0.02,
+    "ok": true
+  },
+  "scopeRejection": true,
+  "ok": false,
+  "error": "owner key not revoked"
+}
