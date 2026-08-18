@@ -7,7 +7,8 @@
   },
   "dependencies": {
     "@noble/curves": "1.8.1",
-    "@noble/hashes": "1.7.1",
+    "@noble/ed25519": "^2.3.0",
+    "@noble/hashes": "^1.7.1",
     "bs58": "^4.0.1",
     "near-api-js": "0.44.2"
   }

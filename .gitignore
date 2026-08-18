@@ -6,3 +6,4 @@ contract/target/
 
 contract/target/
 sandbox-tests-rs/target/
+testbench/bench-session.json
