@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CLEAR — consumer mockup</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; font-family:-apple-system,'SF Pro Text','Segoe UI',Inter,Roboto,sans-serif; }
+  body { background:#eef1f6; padding:34px 0 44px; }
+  .stage { display:flex; gap:34px; justify-content:center; align-items:flex-start; flex-wrap:wrap; padding:0 24px; }
+  .phone { width:340px; background:#fff; border-radius:38px; box-shadow:0 22px 60px rgba(20,30,60,.18), 0 2px 8px rgba(20,30,60,.08); overflow:hidden; border:7px solid #10131a; }
+  .notch { width:110px; height:22px; background:#10131a; border-radius:0 0 14px 14px; margin:0 auto; }
+  .screen { padding:16px 18px 20px; min-height:560px; display:flex; flex-direction:column; }
+  .label { text-align:center; margin-top:14px; font-size:12.5px; color:#5a6472; font-weight:600; letter-spacing:.4px; }
+  .label b { color:#111; }
+  /* status bar */
+  .status { display:flex; justify-content:space-between; font-size:11px; color:#111; padding:6px 4px 10px; font-weight:600; }
+  .tabs { display:flex; border-top:1px solid #e6eaf0; padding:9px 6px 5px; margin-top:auto; }
+  .tab { flex:1; text-align:center; font-size:9.5px; color:#9aa3b2; }
+  .tab .ic { font-size:18px; display:block; margin-bottom:2px; }
+  .tab.on { color:#0da271; font-weight:700; }
+  /* balance card */
+  .bal { background:linear-gradient(135deg,#0da271,#0b8a5f); border-radius:20px; padding:18px 20px; color:#fff; box-shadow:0 10px 22px rgba(13,162,113,.25); }
+  .bal .cap { font-size:11px; opacity:.85; letter-spacing:.6px; font-weight:600; }
+  .bal .num { font-size:33px; font-weight:800; margin-top:3px; letter-spacing:-.5px; }
+  .bal .row { display:flex; justify-content:space-between; margin-top:10px; font-size:11px; opacity:.9; }
+  .h { font-size:13px; font-weight:800; color:#111; margin:20px 2px 10px; display:flex; justify-content:space-between; align-items:center;}
+  .h span.link { font-size:11.5px; color:#0da271; font-weight:600; }
+  /* request card */
+  .req { border:1px solid #e6eaf0; border-radius:18px; padding:16px; box-shadow:0 3px 10px rgba(20,30,60,.05); }
+  .req .top { display:flex; gap:12px; align-items:center; }
+  .avatar { width:44px; height:44px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:800; font-size:17px; color:#fff; }
+  .a-k { background:#6366f1; } .a-a { background:#f59e0b; } .a-m { background:#334155; }
+  .who { font-size:13.5px; font-weight:700; color:#111; }
+  .sub { font-size:11.5px; color:#77808f; margin-top:2px; }
+  .payline { display:flex; align-items:baseline; gap:8px; margin:14px 2px 4px; }
+  .amount { font-size:27px; font-weight:800; color:#111; letter-spacing:-.4px; }
+  .amount small { font-size:13px; color:#9aa3b2; font-weight:600; }
+  .note { font-size:11.5px; color:#77808f; background:#f6f8fb; border-radius:10px; padding:8px 10px; margin-top:10px; }
+  .note b { color:#4b5563; }
+  .btnrow { display:flex; align-items:center; gap:10px; margin-top:14px; }
+  .btn { flex:1; background:#0da271; color:#fff; border:none; border-radius:13px; padding:13px 0; font-size:14.5px; font-weight:700; box-shadow:0 6px 14px rgba(13,162,113,.3); }
+  .decline { text-align:center; font-size:11.5px; color:#9aa3b2; margin-top:12px; }
+  .decline u { color:#77808f; }
+  /* activity */
+  .act { display:flex; gap:11px; align-items:center; padding:11px 4px; border-bottom:1px solid #f0f2f6; }
+  .act:last-child { border-bottom:none; }
+  .ic { width:36px; height:36px; border-radius:12px; background:#f1f4f9; display:flex; align-items:center; justify-content:center; font-size:16px; }
+  .undo { font-size:10.5px; color:#b45309; background:#fef3c7; border-radius:8px; padding:4px 8px; font-weight:700; margin-left:auto; white-space:nowrap; }
+  .amt2 { margin-left:auto; font-size:13px; font-weight:700; color:#111; }
+  .amt2 small { display:block; font-size:10px; color:#9aa3b2; font-weight:500; text-align:right; }
+  /* permissions */
+  .pcard { border:1px solid #e6eaf0; border-radius:18px; overflow:hidden; margin-bottom:14px; }
+  .phead { display:flex; gap:12px; align-items:center; padding:15px; background:#fbfcfe; border-bottom:1px solid #eef1f6; }
+  .prow { display:flex; justify-content:space-between; align-items:center; padding:12px 15px; border-bottom:1px solid #f3f5f9; font-size:13px; color:#374151; }
+  .prow:last-child { border-bottom:none; }
+  .tog { width:42px; height:25px; border-radius:14px; background:#d7dde7; position:relative; }
+  .tog i { position:absolute; top:2.5px; left:3px; width:20px; height:20px; border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(0,0,0,.2); }
+  .tog.on { background:#0da271; } .tog.on i { left:19px; }
+  .no { color:#ef4444 !important; font-weight:700; }
+  .budget { padding:13px 15px; background:#f6f8fb; border-top:1px solid #eef1f6; }
+  .bar { height:7px; border-radius:5px; background:#e2e7ef; overflow:hidden; margin:7px 0 5px; }
+  .bar i { display:block; height:100%; width:92%; background:#f59e0b; border-radius:5px; }
+  .bl { font-size:11.5px; color:#77808f; display:flex; justify-content:space-between; }
+  .bl b { color:#b45309; }
+  .danger { margin-top:4px; border-radius:16px; padding:15px; background:#fff7ed; border:1px solid #fed7aa; }
+  .danger .t { font-size:12.5px; font-weight:800; color:#9a3412; margin-bottom:8px; }
+  .danger ul { list-style:none; }
+  .danger li { font-size:12px; color:#7c2d12; padding:3px 0; }
+  .remove { width:100%; background:#fef2f2; color:#dc2626; border:1px solid #fecaca; border-radius:13px; padding:12px 0; font-size:13.5px; font-weight:700; margin-top:6px; }
+  .grantbtn { width:100%; background:#111; color:#fff; border:none; border-radius:13px; padding:13px 0; font-size:14px; font-weight:700; margin-top:14px; }
+  .trust { display:flex; gap:9px; align-items:center; margin-top:12px; font-size:10.5px; color:#77808f; justify-content:center; }
+  .foot { text-align:center; font-size:11px; color:#9aa3b2; margin-top:26px; }
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <!-- PHONE 1: HOME / REQUESTS -->
+  <div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="screen">
+        <div class="status"><span>9:41</span><span>▮▮▮ ᯤ 🔋</span></div>
+        <div class="bal">
+          <div class="cap">AVAILABLE</div>
+          <div class="num">$1,246.32</div>
+          <div class="row"><span>Joint with Alice · 2 approvals needed over $200</span><span>↗</span></div>
+        </div>
+        <div class="h">Needs your approval <span class="link">1 request</span></div>
+        <div class="req">
+          <div class="top">
+            <div class="avatar a-k">K</div>
+            <div>
+              <div class="who">Kampy Café</div>
+              <div class="sub">Requested by your assistant · 2 min ago</div>
+            </div>
+          </div>
+          <div class="payline"><div class="amount">$12.40 <small>USD</small></div></div>
+          <div class="note">💬 <b>Monthly subscription</b> — same amount as last 3 months</div>
+          <div class="note" style="background:#fffbeb">⏳ <b>Alice's assistant</b> hasn't okayed this yet (needed for payments over $10)</div>
+          <div class="btnrow"><button class="btn">Approve $12.40</button></div>
+          <div class="decline">Not sure? <u>Decline</u> or <u>ask the group</u></div>
+        </div>
+        <div class="h">Today</div>
+        <div class="act"><div class="ic">☕</div><div><div class="who" style="font-size:12.5px">Metro Café</div><div class="sub">11:20 AM · card</div></div><div class="undo">UNDO · 58m</div></div>
+        <div class="act"><div class="ic">💰</div><div><div class="who" style="font-size:12.5px">Topped up budget</div><div class="sub">10:02 AM · assistant allowance</div></div><div class="amt2">−$25.00<small>to assistant</small></div></div>
+        <div class="tabs">
+          <div class="tab on"><span class="ic">🏠</span>Home</div>
+          <div class="tab"><span class="ic">📨</span>Requests</div>
+          <div class="tab"><span class="ic">🛡️</span>Permissions</div>
+          <div class="tab"><span class="ic">👤</span>Profile</div>
+        </div>
+      </div>
+    </div>
+    <div class="label"><b>1 · Requests</b> — fiat-first, faces not npubs, one green button, Undo = timelock</div>
+  </div>
+
+  <!-- PHONE 2: PERMISSIONS -->
+  <div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="screen">
+        <div class="status"><span>9:41</span><span>▮▮▮ ᯤ 🔋</span></div>
+        <div class="h" style="margin-top:6px">Permissions</div>
+        <div class="pcard">
+          <div class="phead">
+            <div class="avatar a-a" style="width:38px;height:38px;font-size:15px">🤖</div>
+            <div>
+              <div class="who">Kampy's assistant</div>
+              <div class="sub">Added Aug 12 · acts for you</div>
+            </div>
+          </div>
+          <div class="prow"><span>Approve payments for you</span><div class="tog on"><i></i></div></div>
+          <div class="prow"><span class="no">Send money on its own</span><div class="tog"><i></i></div></div>
+          <div class="prow"><span>Change your settings</span><div class="tog"><i></i></div></div>
+          <div class="prow"><span>Spending cap</span><b style="color:#111">$50 / month</b></div>
+          <div class="budget">
+            <div class="bl"><span>Assistant budget this month</span><b>$4.12 left</b></div>
+            <div class="bar"><i></i></div>
+            <div class="bl"><span>used $45.88 of $50</span><u style="color:#0da271">Top up</u></div>
+          </div>
+          <div style="padding:12px 15px"><button class="remove">Remove access</button></div>
+        </div>
+        <div class="pcard">
+          <div class="phead">
+            <div class="avatar a-m" style="width:38px;height:38px;font-size:15px">A</div>
+            <div>
+              <div class="who">Alice (joint owner)</div>
+              <div class="sub">Co-signer · approvals over $200</div>
+            </div>
+          </div>
+          <div class="prow"><span>Approve payments</span><div class="tog on"><i></i></div></div>
+          <div class="prow"><span>Send without asking you</span><div class="tog"><i></i></div></div>
+        </div>
+        <div class="tabs">
+          <div class="tab"><span class="ic">🏠</span>Home</div>
+          <div class="tab"><span class="ic">📨</span>Requests</div>
+          <div class="tab on"><span class="ic">🛡️</span>Permissions</div>
+          <div class="tab"><span class="ic">👤</span>Profile</div>
+        </div>
+      </div>
+    </div>
+    <div class="label"><b>2 · Permissions</b> — iOS-style toggles; the agent = an assistant with an allowance</div>
+  </div>
+
+  <!-- PHONE 3: GRANT TIME -->
+  <div>
+    <div class="phone">
+      <div class="notch"></div>
+      <div class="screen">
+        <div class="status"><span>9:41</span><span>▮▮▮ ᯤ 🔋</span></div>
+        <div class="h" style="margin-top:6px">Connecting an app…</div>
+        <div class="req">
+          <div class="top">
+            <div class="avatar a-k">S</div>
+            <div>
+              <div class="who">SplitShare</div>
+              <div class="sub">wants to connect · split bills with friends</div>
+            </div>
+          </div>
+        </div>
+        <div class="danger" style="margin-top:14px">
+          <div class="t">⚠️ In plain English</div>
+          <ul>
+            <li>✅ It can <b>show your balance</b> and <b>suggest payments</b></li>
+            <li>✅ It can <b>approve payments under $20</b></li>
+            <li>🚫 It can <b>never send money</b> without your OK</li>
+            <li>🚫 It can <b>never change</b> who has access</li>
+            <li>💸 It pays its own fees from a <b>$10 starter budget</b></li>
+          </ul>
+        </div>
+        <div class="req" style="margin-top:14px">
+          <div class="note">🔒 Every payment over $20 gets a <b>1-hour cancel window</b></div>
+        </div>
+        <button class="grantbtn">Allow · limited access</button>
+        <button class="remove" style="background:#f6f8fb;color:#374151;border-color:#e6eaf0">Not now</button>
+        <div class="trust">🛡️ Runs on CLEAR · secured by 2-of-2 approvals you control</div>
+        <div class="tabs">
+          <div class="tab"><span class="ic">🏠</span>Home</div>
+          <div class="tab"><span class="ic">📨</span>Requests</div>
+          <div class="tab on"><span class="ic">🛡️</span>Permissions</div>
+          <div class="tab"><span class="ic">👤</span>Profile</div>
+        </div>
+      </div>
+    </div>
+    <div class="label"><b>3 · Grant time</b> — danger translated before the tap, worst-case shown first</div>
+  </div>
+
+</div>
+<div class="foot">CLEAR consumer mode — same contract as the pro UI: scoped keys, thresholds, timelocks, allowances. Zero crypto vocabulary.</div>
+</body>
+</html>
