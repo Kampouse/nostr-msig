@@ -1,0 +1,14 @@
+{
+  "name": "nostr-msig-testbench",
+  "private": true,
+  "description": "Self-contained testnet testbench for nostr-msig v4 (session keys / NEP-611 gas keys)",
+  "scripts": {
+    "bench": "node run.js"
+  },
+  "dependencies": {
+    "@noble/curves": "1.8.1",
+    "@noble/hashes": "1.7.1",
+    "bs58": "^4.0.1",
+    "near-api-js": "0.44.2"
+  }
+}
