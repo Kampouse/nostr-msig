@@ -1,9 +1,9 @@
 use near_sdk::borsh::{BorshDeserialize, BorshSerialize};
-use near_sdk::collections::{LookupMap, Vector};
+use near_sdk::collections::{LookupMap, UnorderedSet, Vector};
 use near_sdk::json_types::U128;
 use near_sdk::{
-    env, log, near, near_bindgen, AccountId, BorshStorageKey, NearToken,
-    PanicOnDefault, Promise, PromiseOrValue, PromiseResult,
+    env, log, near, near_bindgen, AccountId, Allowance, BorshStorageKey, CurveType,
+    NearToken, PanicOnDefault, Promise, PromiseOrValue, PromiseResult, PublicKey,
 };
 
 mod ft;
@@ -28,6 +28,19 @@ const STORAGE_DEPOSIT_YOCTO: u128 = 500_000_000_000_000_000_000_000; // 0.5 NEAR
 const DEFAULT_EXECUTION_GAS_TGAS: u64 = 50;
 /// Maximum execution gas (Tgas)
 const MAX_EXECUTION_GAS_TGAS: u64 = 300;
+/// Maximum nonce slots a session gas key may reserve (NEP-611 protocol max)
+const MAX_SESSION_NONCES: u32 = 1024;
+/// Maximum session lifetime: 30 days (nanoseconds)
+const MAX_SESSION_DURATION_NS: u64 = 30 * 24 * 60 * 60 * 1_000_000_000;
+/// Cumulative funding cap per session gas key (1 NEAR). NEP-611 burns a gas
+/// key's remaining balance (up to 1 NEAR) when the key is deleted; above 1
+/// NEAR deletion fails outright. Capping funding keeps `revoke_session` able
+/// to delete the key on-chain.
+const MAX_SESSION_FUND_YOCTO: u128 = 1_000_000_000_000_000_000_000_000;
+/// Minimum wallet balance that must remain after funding a session key
+const MIN_WALLET_RESERVE_YOCTO: u128 = 100_000_000_000_000_000_000_000; // 0.1 NEAR
+/// Methods a session gas key may call on this contract
+const SESSION_KEY_METHODS: &str = "submit_action,session_ping";
 
 // ── Storage Keys ──────────────────────────────────────────────────────────
 
@@ -39,6 +52,8 @@ enum StorageKey {
     Proposals,
     Delegations,
     WalletNames,
+    Sessions,
+    SessionKeys,
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -235,6 +250,50 @@ impl Proposal {
     }
 }
 
+// ── Session Keys (v4 — NEP-611 gas keys) ───────────────────────────────────
+
+/// Metadata for a registered session gas key.
+/// The actual key (balance, nonces, allowed methods) lives in the account's
+/// access-key state; this is the contract's registry of which sessions exist.
+#[derive(Clone, Debug)]
+#[near(serializers = [borsh, json])]
+pub struct SessionMeta {
+    /// ed25519 public key, 64 hex chars, no "ed25519:" prefix
+    pub public_key: String,
+    /// Wallet the session may operate on
+    pub wallet: String,
+    /// Creation time (nanoseconds)
+    pub created_at: u64,
+    /// Expiry time (nanoseconds). Session is refused at or after this time.
+    pub expires_at: u64,
+    /// Cumulative yoctoNEAR moved into the gas key via transfer_to_gas_key
+    pub funded_yocto: u128,
+    /// Optional human label
+    pub label: Option<String>,
+}
+
+impl SessionMeta {
+    fn is_active(&self, now_ns: u64) -> bool {
+        now_ns < self.expires_at
+    }
+}
+
+/// Normalize a public key string to 64 lowercase hex chars (no prefix).
+fn normalize_pk_hex(public_key: &str) -> String {
+    let pk = public_key.trim().to_lowercase();
+    let pk = pk.strip_prefix("ed25519:").unwrap_or(&pk);
+    assert!(pk.len() == 64, "ERR_INVALID_PK_LEN: expected 64 hex chars");
+    assert!(pk.chars().all(|c| c.is_ascii_hexdigit()), "ERR_INVALID_PK_HEX");
+    pk.to_string()
+}
+
+/// Rebuild a near_sdk::PublicKey from a 64-char hex ed25519 key.
+fn parse_ed25519_pk(pk_hex: &str) -> PublicKey {
+    let bytes = message::hex_decode(pk_hex);
+    PublicKey::from_parts(CurveType::ED25519, bytes)
+        .unwrap_or_else(|_| env::panic_str("ERR_INVALID_PK"))
+}
+
 // ── Wallet Migration ──────────────────────────────────────────────────────
 
 /// Old wallet format (V1) — no spending limits or relayer config.
@@ -403,9 +462,7 @@ fn safe_json_ft_transfer(recipient: &str, amount: &str) -> Vec<u8> {
 
 // ── Contract ───────────────────────────────────────────────────────────────
 
-#[derive(BorshDeserialize, BorshSerialize, PanicOnDefault)]
-#[borsh(crate = "near_sdk::borsh")]
-#[near_bindgen]
+#[near(contract_state)]
 pub struct Contract {
     /// Contract version for migration tracking.
     version: u32,
@@ -428,6 +485,51 @@ pub struct Contract {
     paused: bool,
     /// Reentrancy guard — true while executing a cross-contract call.
     locked: bool,
+    /// v4: registered session gas keys (pubkey hex -> meta)
+    sessions: LookupMap<String, SessionMeta>,
+    /// v4: enumerable set of session pubkey hexes
+    session_keys: UnorderedSet<String>,
+}
+
+/// v3 contract state (before session keys) — used only for state migration.
+#[derive(BorshDeserialize)]
+#[borsh(crate = "near_sdk::borsh")]
+struct ContractV3 {
+    version: u32,
+    owner_npubs: Vec<String>,
+    guardian_npub: Option<String>,
+    wallets: LookupMap<String, Wallet>,
+    intents: LookupMap<String, Intent>,
+    proposals: LookupMap<String, Proposal>,
+    delegations: LookupMap<String, AccountId>,
+    event_nonce: u64,
+    owner_nonce: u64,
+    owner_nonce_bitmap: u64,
+    wallet_names: Vector<String>,
+    paused: bool,
+    locked: bool,
+}
+
+impl From<ContractV3> for Contract {
+    fn from(old: ContractV3) -> Self {
+        Contract {
+            version: 4,
+            owner_npubs: old.owner_npubs,
+            guardian_npub: old.guardian_npub,
+            wallets: old.wallets,
+            intents: old.intents,
+            proposals: old.proposals,
+            delegations: old.delegations,
+            event_nonce: old.event_nonce,
+            owner_nonce: old.owner_nonce,
+            owner_nonce_bitmap: old.owner_nonce_bitmap,
+            wallet_names: old.wallet_names,
+            paused: old.paused,
+            locked: old.locked,
+            sessions: LookupMap::new(StorageKey::Sessions),
+            session_keys: UnorderedSet::new(StorageKey::SessionKeys),
+        }
+    }
 }
 
 #[near_bindgen]
@@ -437,6 +539,7 @@ impl Contract {
     fn init_state(&mut self) {
         if self.paused {} // ensure field exists on old state
         if self.version == 0 { self.version = 2; } // migration from v0/v1
+        if self.version == 3 { self.version = 4; } // v3 state under v4 code (migrate() path fallback)
     }
 
     /// Assert contract is not paused.
@@ -483,6 +586,322 @@ impl Contract {
     /// Get contract version.
     pub fn get_version(&self) -> u32 {
         self.version
+    }
+
+    // ── Session Keys (v4 — NEP-611 gas keys) ────────────────────────
+
+    /// Resolve the calling signer's public key to a registered, unexpired
+    /// session. Gas-key transactions are signed by a key ON the contract
+    /// account, so `env::signer_account_pk()` identifies the session.
+    fn require_session_caller(&self) -> (String, SessionMeta) {
+        let pk = signer_pk_hex();
+        let meta = self
+            .sessions
+            .get(&pk)
+            .unwrap_or_else(|| env::panic_str("ERR_NOT_SESSION_KEY"));
+        assert!(
+            meta.is_active(env::block_timestamp()),
+            "ERR_SESSION_EXPIRED"
+        );
+        (pk, meta)
+    }
+
+    /// Register a session gas key for a wallet. The key can then pay for and
+    /// submit `submit_action` / `session_ping` calls directly — no relayer
+    /// needed. Requires an owner nostr signature over
+    /// `expires {sig_expiry}.000000000: add_session_key:{pk_hex} | nonce: {n} | contract: {id}`.
+    ///
+    /// The initial gas is debited from the wallet's internal NEAR balance and
+    /// moved into the gas key's prepaid balance via `transfer_to_gas_key`.
+    pub fn add_session_key(
+        &mut self,
+        public_key: String,
+        num_nonces: u32,
+        expires_at: u64,
+        wallet: String,
+        label: Option<String>,
+        initial_gas: U128,
+        nonce: u64,
+        expires_at_sig: u64,
+        signature: String,
+    ) {
+        self.assert_not_paused();
+        let pk = normalize_pk_hex(&public_key);
+        self.verify_owner(
+            &format!("add_session_key:{}", pk),
+            &signature,
+            expires_at_sig,
+            nonce,
+        );
+
+        assert!(self.sessions.get(&pk).is_none(), "ERR_SESSION_EXISTS");
+        assert!(
+            self.wallet_get_readonly(&wallet).is_some(),
+            "ERR_WALLET_NOT_FOUND"
+        );
+
+        let now = env::block_timestamp();
+        assert!(expires_at > now, "ERR_SESSION_EXPIRED");
+        let expires_at = expires_at.min(now + MAX_SESSION_DURATION_NS);
+        let nn = num_nonces.clamp(1, MAX_SESSION_NONCES);
+        let gas = initial_gas.0;
+        assert!(
+            gas <= MAX_SESSION_FUND_YOCTO,
+            "ERR_SESSION_FUND_CAP: cumulative funding max 1 NEAR"
+        );
+
+        if gas > 0 {
+            let bal = self.get_wallet_near_balance(wallet.clone()).0;
+            assert!(
+                bal >= gas + MIN_WALLET_RESERVE_YOCTO,
+                "ERR_SESSION_INSUFFICIENT_BALANCE: wallet needs {} + 0.1 NEAR reserve",
+                gas
+            );
+            self.debit_near(&wallet, gas);
+        }
+
+        let meta = SessionMeta {
+            public_key: pk.clone(),
+            wallet: wallet.clone(),
+            created_at: now,
+            expires_at,
+            funded_yocto: gas,
+            label: label.clone(),
+        };
+        self.sessions.insert(&pk, &meta);
+        self.session_keys.insert(&pk);
+
+        let self_id = env::current_account_id();
+        let parsed = parse_ed25519_pk(&pk);
+        let mut batch = Promise::new(self_id.clone()).add_gas_key_allowance_function_call(
+            parsed.clone(),
+            nn,
+            Allowance::Unlimited,
+            self_id.clone(),
+            SESSION_KEY_METHODS.to_string(),
+        );
+        if gas > 0 {
+            batch = batch.transfer_to_gas_key(parsed, NearToken::from_yoctonear(gas));
+        }
+        let _ = batch; // promise scheduled; state committed regardless of receipt outcome
+
+        self.emit_event("session_key_added", serde_json::json!({
+            "public_key": pk,
+            "wallet": wallet,
+            "expires_at": expires_at,
+            "num_nonces": nn,
+            "initial_gas": gas.to_string(),
+        }));
+        log!(
+            "Session key {}… added for wallet '{}' ({} nonces, {} yoctoNEAR gas)",
+            &pk[..16],
+            wallet,
+            nn,
+            gas
+        );
+    }
+
+    /// Top up a session gas key's prepaid balance from the wallet's internal
+    /// NEAR balance. Owner-signed over
+    /// `expires {sig_expiry}.000000000: refresh_session:{pk_hex}:{amount_yocto} | nonce: {n} | contract: {id}`.
+    pub fn refresh_session(
+        &mut self,
+        public_key: String,
+        amount: U128,
+        nonce: u64,
+        expires_at_sig: u64,
+        signature: String,
+    ) {
+        self.assert_not_paused();
+        let pk = normalize_pk_hex(&public_key);
+        self.verify_owner(
+            &format!("refresh_session:{}:{}", pk, amount.0),
+            &signature,
+            expires_at_sig,
+            nonce,
+        );
+
+        let mut meta = self
+            .sessions
+            .get(&pk)
+            .unwrap_or_else(|| env::panic_str("ERR_SESSION_NOT_FOUND"));
+        assert!(
+            meta.is_active(env::block_timestamp()),
+            "ERR_SESSION_EXPIRED"
+        );
+        let amt = amount.0;
+        let new_funded = meta.funded_yocto + amt;
+        assert!(
+            new_funded <= MAX_SESSION_FUND_YOCTO,
+            "ERR_SESSION_FUND_CAP: cumulative funding max 1 NEAR"
+        );
+        assert!(amt > 0, "ERR_ZERO_AMOUNT");
+
+        let bal = self.get_wallet_near_balance(meta.wallet.clone()).0;
+        assert!(
+            bal >= amt + MIN_WALLET_RESERVE_YOCTO,
+            "ERR_SESSION_INSUFFICIENT_BALANCE"
+        );
+        self.debit_near(&meta.wallet, amt);
+
+        meta.funded_yocto = new_funded;
+        self.sessions.insert(&pk, &meta);
+
+        let self_id = env::current_account_id();
+        Promise::new(self_id).transfer_to_gas_key(
+            parse_ed25519_pk(&pk),
+            NearToken::from_yoctonear(amt),
+        );
+
+        self.emit_event("session_key_refreshed", serde_json::json!({
+            "public_key": pk,
+            "wallet": meta.wallet,
+            "amount": amt.to_string(),
+            "funded_total": meta.funded_yocto.to_string(),
+        }));
+        log!("Session key {}… topped up with {} yoctoNEAR", &pk[..16], amt);
+    }
+
+    /// Revoke a session: removes the contract's SessionMeta and schedules a
+    /// `delete_key` on the gas key. NEP-611 burns any remaining gas-key
+    /// balance ≤ 1 NEAR on deletion (funding is capped at 1 NEAR for this
+    /// reason). To salvage unspent NEAR instead, first run
+    /// `near account withdraw-from-gas-key …` from the owner CLI.
+    /// Owner-signed over
+    /// `expires {sig_expiry}.000000000: revoke_session:{pk_hex} | nonce: {n} | contract: {id}`.
+    pub fn revoke_session(
+        &mut self,
+        public_key: String,
+        nonce: u64,
+        expires_at_sig: u64,
+        signature: String,
+    ) {
+        self.verify_owner(
+            &format!("revoke_session:{}", normalize_pk_hex(&public_key)),
+            &signature,
+            expires_at_sig,
+            nonce,
+        );
+        let pk = normalize_pk_hex(&public_key);
+        let meta = self
+            .sessions
+            .get(&pk)
+            .unwrap_or_else(|| env::panic_str("ERR_SESSION_NOT_FOUND"));
+
+        self.sessions.remove(&pk);
+        self.session_keys.remove(&pk);
+
+        Promise::new(env::current_account_id()).delete_key(parse_ed25519_pk(&pk));
+
+        self.emit_event("session_key_revoked", serde_json::json!({
+            "public_key": pk,
+            "wallet": meta.wallet,
+        }));
+        log!(
+            "Session key {}… revoked (remaining gas-key balance is burned per NEP-611)",
+            &pk[..16]
+        );
+    }
+
+    /// Relayer-free entry point that ONLY a registered session gas key may
+    /// call (the gas key's prepaid balance pays for the transaction). The
+    /// inner action still requires the owner's nostr signature, using the
+    /// exact v3 message formats, so the owner authorizes every action while
+    /// the session key only supplies gas. Available inner actions:
+    /// `propose`, `amend`, `execute`, `quick`.
+    ///
+    /// NOTE: gas keys cannot attach deposits, so Deposit-type executions
+    /// through this path credit 0 NEAR — use the relayer path for deposits.
+    pub fn submit_action(
+        &mut self,
+        action: String,
+        wallet_name: String,
+        intent_index: u32,
+        proposal_id: u64,
+        param_values: String,
+        expires_at: u64,
+        nonce: u64,
+        signature: String,
+    ) {
+        self.assert_not_paused();
+        self.assert_not_locked();
+        let (pk, meta) = self.require_session_caller();
+        assert_eq!(meta.wallet, wallet_name, "ERR_SESSION_WALLET_MISMATCH");
+        log!("submit_action '{}' via session key {}…", action, &pk[..16]);
+
+        match action.as_str() {
+            "propose" => {
+                let pid = self
+                    .wallet_get_readonly(&wallet_name)
+                    .expect("ERR_WALLET_NOT_FOUND")
+                    .proposal_index;
+                self.verify_owner(
+                    &format!("propose:{}:{}", wallet_name, pid),
+                    &signature,
+                    expires_at,
+                    nonce,
+                );
+                self.propose_inner(wallet_name.clone(), intent_index, param_values, expires_at);
+            }
+            "amend" => {
+                self.verify_owner(
+                    &format!("amend:{}:{}", wallet_name, proposal_id),
+                    &signature,
+                    expires_at,
+                    nonce,
+                );
+                self.amend_inner(wallet_name.clone(), proposal_id, param_values, expires_at);
+            }
+            "execute" => {
+                self.verify_owner(
+                    &format!("execute:{}:{}", wallet_name, proposal_id),
+                    &signature,
+                    expires_at,
+                    nonce,
+                );
+                self.execute_proposal(&wallet_name, proposal_id);
+            }
+            "quick" => {
+                let action_str = format!(
+                    "quick:{}:{}:{}",
+                    wallet_name,
+                    intent_index,
+                    &param_values.chars().take(64).collect::<String>()
+                );
+                self.verify_owner(&action_str, &signature, expires_at, nonce);
+                self.quick_execute_inner(wallet_name.clone(), intent_index, param_values, expires_at, true);
+            }
+            _ => env::panic_str("ERR_INVALID_ACTION: expected propose|amend|execute|quick"),
+        }
+    }
+
+    /// Health check / gas-key probe. Only a registered, unexpired session key
+    /// may call it; the gas key's balance pays the (small) fee.
+    pub fn session_ping(&mut self) -> String {
+        self.assert_not_paused();
+        let (pk, meta) = self.require_session_caller();
+        format!("pong:{}:{}", meta.wallet, &pk[..16])
+    }
+
+    /// List session metadata for a wallet. (Gas-key balances are not visible
+    /// on-chain from the contract — query `view_access_key` via RPC for those.)
+    pub fn list_sessions(&self, wallet: String) -> Vec<SessionMeta> {
+        self.session_keys
+            .iter()
+            .filter_map(|pk| self.sessions.get(&pk))
+            .filter(|m| m.wallet == wallet)
+            .collect()
+    }
+
+    /// Get one session's metadata by public key (hex or "ed25519:…" form).
+    pub fn get_session(&self, public_key: String) -> Option<SessionMeta> {
+        let pk = normalize_pk_hex(&public_key);
+        self.sessions.get(&pk)
+    }
+
+    /// Total number of registered sessions.
+    pub fn get_session_count(&self) -> u64 {
+        self.session_keys.len()
     }
 
     // ── Wallet Storage Helpers (with migration) ──────────────────────
@@ -536,7 +955,7 @@ impl Contract {
             assert!(np.chars().all(|c| c.is_ascii_hexdigit()), "ERR_INVALID_NPUB_HEX");
         }
         Self {
-            version: 3,
+            version: 4,
             owner_npubs,
             guardian_npub: None,
             wallets: LookupMap::new(StorageKey::Wallets),
@@ -549,7 +968,18 @@ impl Contract {
             wallet_names: Vector::new(StorageKey::WalletNames),
             paused: false,
             locked: false,
+            sessions: LookupMap::new(StorageKey::Sessions),
+            session_keys: UnorderedSet::new(StorageKey::SessionKeys),
         }
+    }
+
+    /// Migrate v3 state to v4 (adds empty session registries).
+    /// Call once after deploying v4 code over a v3 contract.
+    #[init(ignore_state)]
+    pub fn migrate() -> Self {
+        let old: ContractV3 = env::state_read().expect("ERR_NO_PREVIOUS_STATE");
+        log!("Migrated contract state v{} -> v4", old.version);
+        old.into()
     }
 
     /// Verify the caller is an owner via schnorr signature over
@@ -872,6 +1302,25 @@ impl Contract {
         signature: String,
     ) {
         self.assert_not_paused();
+        // Signature binds to the proposal id that will be assigned
+        let proposal_index = self
+            .wallet_get_readonly(&wallet_name)
+            .expect("ERR_WALLET_NOT_FOUND")
+            .proposal_index;
+        // Verify nostr owner signature
+        self.verify_owner(&format!("propose:{}:{}", wallet_name, proposal_index), &signature, expires_at, nonce);
+        self.propose_inner(wallet_name, intent_index, param_values, expires_at);
+    }
+
+    /// Propose logic shared by the relayer path (`propose`) and the session-key
+    /// path (`submit_action`). Auth is verified by the caller.
+    fn propose_inner(
+        &mut self,
+        wallet_name: String,
+        intent_index: u32,
+        param_values: String,
+        expires_at: u64,
+    ) {
         let mut wallet = self.wallet_get_readonly(&wallet_name).expect("ERR_WALLET_NOT_FOUND");
         let ikey = intent_key(&wallet_name, intent_index);
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
@@ -886,9 +1335,6 @@ impl Contract {
 
         let proposal_index = wallet.proposal_index;
         let msg = message::build_message(&wallet_name, proposal_index, expires_at, "propose", &intent, &params);
-
-        // Verify nostr owner signature
-        self.verify_owner(&format!("propose:{}:{}", wallet_name, proposal_index), &signature, expires_at, nonce);
 
         let proposal = Proposal {
             id: proposal_index,
@@ -935,6 +1381,19 @@ impl Contract {
         signature: String,
     ) {
         self.assert_not_paused();
+        self.verify_owner(&format!("amend:{}:{}", wallet_name, proposal_id), &signature, expires_at, nonce);
+        self.amend_inner(wallet_name, proposal_id, param_values, expires_at);
+    }
+
+    /// Amend logic shared by the relayer path and the session-key path.
+    /// Auth is verified by the caller.
+    fn amend_inner(
+        &mut self,
+        wallet_name: String,
+        proposal_id: u64,
+        param_values: String,
+        expires_at: u64,
+    ) {
         let pkey = proposal_key(&wallet_name, proposal_id);
         let mut proposal = self.proposals.get(&pkey).expect("ERR_PROPOSAL_NOT_FOUND");
 
@@ -950,9 +1409,6 @@ impl Contract {
         self.validate_params(&intent, &params);
 
         let msg = message::build_message(&wallet_name, proposal_id, expires_at, "amend", &intent, &params);
-
-        // Verify nostr owner signature
-        self.verify_owner(&format!("amend:{}:{}", wallet_name, proposal_id), &signature, expires_at, nonce);
 
         proposal.reset_votes();
         proposal.param_values = param_values;
@@ -1026,16 +1482,32 @@ impl Contract {
         // Verify owner signature for this action
         let action = format!("quick:{}:{}:{}", wallet_name, intent_index, &param_values.chars().take(64).collect::<String>());
         self.verify_owner(&action, &signature, expires_at, nonce);
+        self.quick_execute_inner(wallet_name, intent_index, param_values, expires_at, false);
+    }
 
+    /// Quick-execute logic shared by the relayer path and the session-key path.
+    /// When `via_session` is true the predecessor-based proposer check is
+    /// skipped (under a gas key the predecessor is the contract itself; the
+    /// owner's nostr signature over the full action string is the authority).
+    fn quick_execute_inner(
+        &mut self,
+        wallet_name: String,
+        intent_index: u32,
+        param_values: String,
+        expires_at: u64,
+        via_session: bool,
+    ) {
         let ikey = intent_key(&wallet_name, intent_index);
         let intent = self.intents.get(&ikey).expect("ERR_INTENT_NOT_FOUND");
         assert!(intent.active, "ERR_INTENT_INACTIVE");
         assert!(intent.approval_threshold == 1, "ERR_NOT_SOLO: quick_execute only works with approval_threshold=1");
 
         // Check owner is a proposer
-        let predecessor = env::predecessor_account_id();
-        let owner_is_proposer = intent.proposers.is_empty() || intent.proposers.contains(&predecessor);
-        assert!(owner_is_proposer, "ERR_NOT_PROPOSER: caller not in intent proposers");
+        if !via_session {
+            let predecessor = env::predecessor_account_id();
+            let owner_is_proposer = intent.proposers.is_empty() || intent.proposers.contains(&predecessor);
+            assert!(owner_is_proposer, "ERR_NOT_PROPOSER: caller not in intent proposers");
+        }
 
         // Check owner is in nostr_approvers
         let owner_is_approver = intent.nostr_approvers.iter().any(|p| self.owner_npubs.contains(p));
@@ -2071,6 +2543,145 @@ impl Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_pk_hex() {
+        let hex64 = "ab".repeat(32);
+        // bare hex
+        assert_eq!(normalize_pk_hex(&hex64), hex64);
+        // with prefix (case-insensitive)
+        assert_eq!(normalize_pk_hex(&format!("ed25519:{}", hex64.to_uppercase())), hex64);
+        // wrong length
+        let r = std::panic::catch_unwind(|| normalize_pk_hex("abcd"));
+        assert!(r.is_err());
+        // non-hex
+        let r = std::panic::catch_unwind(|| normalize_pk_hex(&"zz".repeat(32)));
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_session_meta_expiry() {
+        let meta = SessionMeta {
+            public_key: "ab".repeat(32),
+            wallet: "w".to_string(),
+            created_at: 100,
+            expires_at: 1_000,
+            funded_yocto: 0,
+            label: None,
+        };
+        assert!(meta.is_active(999));
+        assert!(!meta.is_active(1_000), "session must be dead at exactly expires_at");
+        assert!(!meta.is_active(2_000));
+    }
+
+    #[test]
+    fn test_session_funding_cap_arithmetic() {
+        // cumulative funding must stay within MAX_SESSION_FUND_YOCTO (1 NEAR)
+        let mut funded: u128 = 0;
+        for amt in [300_000_000_000_000_000_000_000u128, 400_000_000_000_000_000_000_000] {
+            assert!(funded + amt <= MAX_SESSION_FUND_YOCTO);
+            funded += amt;
+        }
+        // one more yocto over the cap must be rejected
+        assert!(funded + 300_000_000_000_000_000_000_001 > MAX_SESSION_FUND_YOCTO);
+    }
+
+    #[test]
+    fn test_session_auth_rejections() {
+        use near_sdk::test_utils::VMContextBuilder;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        fn panic_msg<T>(r: &Result<T, Box<dyn std::any::Any + Send>>) -> String {
+            match r {
+                Ok(_) => "NO PANIC".to_string(),
+                Err(e) => e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "(panic with () payload — env::panic_str)".to_string()),
+            }
+        }
+
+        let owner_npub = "11".repeat(32);
+        let pk_hex = "ab".repeat(32);
+        let pk = parse_ed25519_pk(&pk_hex);
+
+        let mut b = VMContextBuilder::new();
+        b.signer_account_pk(pk);
+        b.block_timestamp(1_000_000_000_000_000_000);
+        near_sdk::testing_env!(b.build());
+
+        let mut c = Contract::new(vec![owner_npub]);
+
+        // 1) unregistered signer key -> rejected (ERR_NOT_SESSION_KEY via panic_str)
+        let r = catch_unwind(AssertUnwindSafe(|| c.session_ping()));
+        assert!(r.is_err(), "unregistered key must be rejected");
+
+        // 2) expired session -> ERR_SESSION_EXPIRED
+        c.sessions.insert(
+            &pk_hex,
+            &SessionMeta {
+                public_key: pk_hex.clone(),
+                wallet: "w1".to_string(),
+                created_at: 0,
+                expires_at: 999_999_999_999_999_999,
+                funded_yocto: 0,
+                label: None,
+            },
+        );
+        let r = catch_unwind(AssertUnwindSafe(|| c.session_ping()));
+        assert!(panic_msg(&r).contains("ERR_SESSION_EXPIRED"), "got: {}", panic_msg(&r));
+
+        // 3) active session -> ping works and identifies wallet + key
+        c.sessions.insert(
+            &pk_hex,
+            &SessionMeta {
+                public_key: pk_hex.clone(),
+                wallet: "w1".to_string(),
+                created_at: 0,
+                expires_at: 2_000_000_000_000_000_000,
+                funded_yocto: 0,
+                label: None,
+            },
+        );
+        let pong = c.session_ping();
+        assert!(pong.starts_with("pong:w1:"), "got: {pong}");
+
+        // 4) session scoped to a different wallet -> ERR_SESSION_WALLET_MISMATCH
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            c.submit_action(
+                "propose".to_string(),
+                "w2".to_string(),
+                0,
+                0,
+                "{}".to_string(),
+                3_000_000_000_000_000_000,
+                0,
+                "00".to_string(),
+            )
+        }));
+        assert!(
+            panic_msg(&r).contains("ERR_SESSION_WALLET_MISMATCH"),
+            "got: {}",
+            panic_msg(&r)
+        );
+
+        // 5) paused contract -> ERR_CONTRACT_PAUSED even for valid session
+        c.paused = true;
+        let r = catch_unwind(AssertUnwindSafe(|| c.session_ping()));
+        assert!(panic_msg(&r).contains("ERR_CONTRACT_PAUSED"), "got: {}", panic_msg(&r));
+    }
+
+    #[test]
+    fn test_parse_ed25519_pk_roundtrip() {
+        use near_sdk::test_utils::VMContextBuilder;
+        let hex64 = "cd".repeat(32);
+        near_sdk::testing_env!(VMContextBuilder::new().build());
+        let parsed = parse_ed25519_pk(&hex64);
+        let bytes = parsed.into_bytes();
+        assert_eq!(bytes[0], 0u8, "curve prefix byte");
+        assert_eq!(hex_encode(&bytes[1..]), hex64);
+    }
 
     #[test]
     fn test_render_template() {
