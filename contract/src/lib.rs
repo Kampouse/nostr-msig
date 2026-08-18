@@ -463,6 +463,7 @@ fn safe_json_ft_transfer(recipient: &str, amount: &str) -> Vec<u8> {
 // ── Contract ───────────────────────────────────────────────────────────────
 
 #[near(contract_state)]
+#[derive(PanicOnDefault)]
 pub struct Contract {
     /// Contract version for migration tracking.
     version: u32,

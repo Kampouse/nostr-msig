@@ -98,6 +98,58 @@ node deploy2.cjs <account-id> <path/to/contract.wasm>
 ```
 
 
+## v4 Session Keys (NEP-611 Gas Keys)
+
+v4 adds **relayer-free session keys**: a client-held ed25519 key that can submit pre-authorized actions to a wallet **without a relayer paying gas**, implemented with [NEP-611 gas keys](https://github.com/near/NEPs/pull/611). Requires protocol ≥85 (testnet/mainnet current) and near-sdk 5.29. Unit tests (`cd contract && cargo +1.95.0 test`, 16 green incl. all 11 v3 tests) and the on-chain e2e (`node e2e-v4.cjs`) both pass green.
+
+### How NEP-611 gas keys work
+
+A gas key is an access key on the **contract account** whose transactions are paid from a **prepaid balance attached to the key itself** instead of the account's balance:
+
+- `GasKeyFunctionCall { balance, num_nonces, allowance: None, receiver_id, method_names }` — balance is the gas budget; `allowance` must be `None`/unlimited (protocol requirement: prepaid balance *is* the budget), `receiver_id` is the contract, `method_names` is `["submit_action", "session_ping"]`.
+- Gas-key transactions use **TransactionV1** with a `GasKeyNonce { nonce, nonce_index }` — up to `num_nonces` (1..=1024) parallel lanes per key, each with its own nonce sequence.
+- **Deletion burns the remaining balance, max 1 NEAR** — so the contract caps lifetime funding at **1 Ⓝ per key** and clients should top up in small increments (`refresh_session`). To recover balance before revoking, the key owner can withdraw on-chain first via CLI (`near account withdraw-from-gas-key …`); the contract itself cannot read a key's balance, so it cannot sweep on revoke.
+- Gas refunds flow back to the gas key's balance.
+
+### Methods (v4)
+
+| Method | Who signs | What it does |
+|---|---|---|
+| `add_session_key(public_key, num_nonces, expires_at, wallet, label, initial_gas, nonce, expires_at_sig, signature)` | owner nostr | Registers the session meta and creates the gas key via promise batch: `add_gas_key_allowance_function_call` (Allowance::Unlimited, methods `submit_action,session_ping`) chained with `transfer_to_gas_key(initial_gas)`. `num_nonces` clamped to 1..=1024, `expires_at` clamped to now+30d, `initial_gas` capped so lifetime funding ≤ 1 Ⓝ. Wallet internal balance is debited. |
+| `refresh_session(public_key, amount, nonce, expires_at_sig, signature)` | owner nostr | Top-up via `transfer_to_gas_key` from the wallet's internal balance (same ≤1 Ⓝ lifetime cap). |
+| `revoke_session(public_key, nonce, expires_at_sig, signature)` | owner nostr | Removes meta + `Promise::delete_key` (remaining balance burns per NEP-611; see above), emits `session_key_revoked`. |
+| `submit_action(action, wallet_name, intent_index, proposal_id, param_values, expires_at, nonce, signature)` | **session key** (gas-key tx) + owner nostr sig in args | Session-key entry point. `env::signer_account_pk()` must equal a registered, unexpired session key bound to `wallet_name`; contract must not be paused. The inner action (`quick`/`propose`/`amend`/`execute`/`cancel`) is verified exactly like the v3 relayer paths — the owner still nostr-signs every action. No attached deposit. |
+| `session_ping()` | session key | No-op liveness check, returns `pong:{wallet}:{pubkey_prefix}`. |
+| `list_sessions(wallet)` / `get_session(public_key)` / `get_session_count()` | view | Session metadata. |
+
+State: `sessions: UnorderedSet<SessionMeta>` + `LookupMap<pubkey, SessionMeta>` with `{public_key, wallet, created_at, expires_at, funded_yocto, label}`. NEP-297 events: `session_key_added` / `session_key_refreshed` / `session_key_revoked`. Deploying v4 over v3 state requires one `migrate()` call (`#[init(ignore_state)]`, reads `ContractV3` state).
+
+### v4 message formats (owner nostr signatures)
+
+Same shape as v3 — `expires {sig_expiry}.000000000: {action} | nonce: {n} | contract: {account_id}`, BIP-340 schnorr over `sha256(message)`:
+
+- `add_session_key:{public_key_hex_64}` (full hex, no `ed25519:` prefix)
+- `refresh_session:{public_key_hex_64}:{amount_yocto}`
+- `revoke_session:{public_key_hex_64}`
+- submit_action inner actions identical to v3 relayer paths (e.g. `quick:{wallet}:{intent_index}:{param_values_first_64_chars}`)
+
+Nonce rules unchanged: client-chosen in `[get_owner_nonce(), +64)` sliding window; failed receipts revert nonce consumption.
+
+### Client notes
+
+- **near-api-js ≤0.44 cannot sign gas-key transactions** (no `TransactionV1`/`GasKeyNonce` support — fails with `InvalidNonceIndex`). Use **near-cli-rs ≥0.30**, which auto-detects gas keys, picks `nonce_index`, and builds TransactionV1:
+
+```bash
+near contract call-function as-transaction nmsig.vault.kampy.testnet submit_action \
+  json-args '{"action":"quick",...}' prepaid-gas '50 Tgas' attached-deposit '0 NEAR' \
+  sign-as nmsig.vault.kampy.testnet network-config testnet \
+  sign-with-plaintext-private-key ed25519:… send
+```
+
+- Chains supporting protocol ≥85 (testnet & mainnet today) accept gas keys; older chains reject TransactionV1.
+- Session keys only pay for gas — the owner nostr signature still gates every action, pause blocks sessions too, and a session is hard-bound to one wallet (`ERR_SESSION_WALLET_MISMATCH` otherwise).
+- RPC quirk: `view_access_key` takes the **base58** (`ed25519:…`) form of the key, while contract args use raw 64-hex.
+
 ## Features
 
 | Feature | Description |
@@ -369,16 +421,16 @@ Placeholders `{param_name}` are replaced with parameter values:
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.86+)
+- [Rust](https://rustup.rs/) (v4 needs rustc 1.93+ for near-sdk 5.29 — `rustup install 1.95.0`; note 1.97 aborts inside cargo-near, 1.86 cannot compile near-sdk 5.29)
 - [cargo-near](https://github.com/near/cargo-near) (`cargo install cargo-near`)
-- [near-cli-rs](https://docs.near.org/tools/near-cli-rs) (`cargo install near-cli-rs`)
+- [near-cli-rs](https://docs.near.org/tools/near-cli-rs) ≥0.30 (`cargo install near-cli-rs`; needed for gas-key TransactionV1 signing)
 - A NEAR account with enough NEAR for deployment + storage
 
 ### Build
 
 ```bash
 cd contract
-cargo near build non-reproducible-wasm
+cargo +1.95.0 near build non-reproducible-wasm
 ```
 
 Output: `target/near/clear_msig.wasm` (~630KB)
@@ -417,7 +469,15 @@ near contract deploy <contract-id> use-file target/near/clear_msig.wasm \
   without-init-call network-config testnet sign-with-keychain send
 ```
 
-> ⚠️ If struct fields changed (e.g., new fields on Wallet/Intent/Proposal), existing state will fail to deserialize. You must delete and recreate the contract account, or write a migration init method.
+> ⚠️ If struct fields changed (e.g., new fields on Wallet/Intent/Proposal), existing state will fail to deserialize. v4 ships a `migrate()` init (`#[init(ignore_state)]`) that converts v3 state — after deploying v4 over v3 call `migrate()` once:
+>
+> ```bash
+> near contract call-function as-transaction <contract-id> migrate json-args '{}' \
+>   prepaid-gas '50 Tgas' attached-deposit '0 NEAR' sign-as <contract-id> \
+>   network-config testnet sign-with-keychain send
+> ```
+>
+> Until migrate runs, every view call panics with `Cannot deserialize the contract state`.
 
 ### First Wallet
 
