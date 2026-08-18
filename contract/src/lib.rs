@@ -42,6 +42,20 @@ const MIN_WALLET_RESERVE_YOCTO: u128 = 100_000_000_000_000_000_000_000; // 0.1 N
 /// Methods a session gas key may call on this contract
 const SESSION_KEY_METHODS: &str = "submit_action,session_ping";
 
+/// Methods a session gas key may be scoped to (v5). Governance methods
+/// (propose/approve/execute/amend/cancel_vote) still verify their own
+/// nostr signatures internally, so widening the *transport* scope never
+/// widens *authority* — the gas key only pays postage.
+const SESSION_KEY_ALLOWED_METHODS: [&str; 7] = [
+    "submit_action",
+    "session_ping",
+    "propose",
+    "approve",
+    "execute",
+    "amend",
+    "cancel_vote",
+];
+
 // ── Storage Keys ──────────────────────────────────────────────────────────
 
 #[derive(BorshSerialize, BorshStorageKey)]
@@ -514,7 +528,7 @@ struct ContractV3 {
 impl From<ContractV3> for Contract {
     fn from(old: ContractV3) -> Self {
         Contract {
-            version: 4,
+            version: 5,
             owner_npubs: old.owner_npubs,
             guardian_npub: old.guardian_npub,
             wallets: old.wallets,
@@ -541,6 +555,7 @@ impl Contract {
         if self.paused {} // ensure field exists on old state
         if self.version == 0 { self.version = 2; } // migration from v0/v1
         if self.version == 3 { self.version = 4; } // v3 state under v4 code (migrate() path fallback)
+        if self.version == 4 { self.version = 5; } // v4 state under v5 code (add_session_key methods param)
     }
 
     /// Assert contract is not paused.
@@ -622,6 +637,10 @@ impl Contract {
         wallet: String,
         label: Option<String>,
         initial_gas: U128,
+        // v5: optional method scope for the gas key. Defaults to the
+        // v4 transport scope (submit_action,session_ping). Each entry
+        // must be in SESSION_KEY_ALLOWED_METHODS.
+        methods: Option<Vec<String>>,
         nonce: u64,
         expires_at_sig: u64,
         signature: String,
@@ -674,12 +693,30 @@ impl Contract {
 
         let self_id = env::current_account_id();
         let parsed = parse_ed25519_pk(&pk);
+        // v5: resolve method scope (validated) or fall back to v4 default
+        let methods_csv = match &methods {
+            Some(list) => {
+                assert!(!list.is_empty(), "ERR_SESSION_METHODS_EMPTY");
+                let mut seen = std::collections::HashSet::new();
+                for m in list {
+                    assert!(
+                        SESSION_KEY_ALLOWED_METHODS.contains(&m.as_str()),
+                        "ERR_SESSION_METHOD_NOT_ALLOWED: {} (allowed: {})",
+                        m,
+                        SESSION_KEY_ALLOWED_METHODS.join(", ")
+                    );
+                    assert!(seen.insert(m.clone()), "ERR_SESSION_METHOD_DUPLICATE: {}", m);
+                }
+                list.join(",")
+            }
+            None => SESSION_KEY_METHODS.to_string(),
+        };
         let mut batch = Promise::new(self_id.clone()).add_gas_key_allowance_function_call(
             parsed.clone(),
             nn,
             Allowance::Unlimited,
             self_id.clone(),
-            SESSION_KEY_METHODS.to_string(),
+            methods_csv.clone(),
         );
         if gas > 0 {
             batch = batch.transfer_to_gas_key(parsed, NearToken::from_yoctonear(gas));
@@ -692,6 +729,7 @@ impl Contract {
             "expires_at": expires_at,
             "num_nonces": nn,
             "initial_gas": gas.to_string(),
+            "methods": methods_csv,
         }));
         log!(
             "Session key {}… added for wallet '{}' ({} nonces, {} yoctoNEAR gas)",
@@ -956,7 +994,7 @@ impl Contract {
             assert!(np.chars().all(|c| c.is_ascii_hexdigit()), "ERR_INVALID_NPUB_HEX");
         }
         Self {
-            version: 4,
+            version: 5,
             owner_npubs,
             guardian_npub: None,
             wallets: LookupMap::new(StorageKey::Wallets),

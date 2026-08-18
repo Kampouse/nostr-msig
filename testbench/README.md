@@ -107,3 +107,23 @@ node cleanup.js bench123.vault.kampy.testnet vault.kampy.testnet
 ```
 
 Deletes the bench account and refunds the remaining balance.
+
+## v5 — widened session-key methods + drain-then-revoke
+
+`add_session_key` takes optional `methods: Vec<String>` (allowlist:
+submit_action, session_ping, propose, approve, execute, amend,
+cancel_vote). Omit it for the v4 default (submit_action,session_ping).
+Governance methods still verify their own nostr sigs — the key only
+pays postage, so widening never widens authority.
+
+Proven live on `benchv5.vault.kampy.testnet` (finish.cjs):
+- propose → agent-npub approve → execute, all as **pure-JS V1 gas-key txs**
+- agent key scoped to [approve, session_ping] enforced by the protocol
+- WithdrawFromGasKey drain → revoke with 0 burned
+
+Key ops gotchas learned the hard way:
+- gas keys can't be deleted while balance > 1Ⓝ (NEP-611 guard) — drain first
+- `delete_wallet` refunds storage only, not the wallet's internal ledger
+- proposals expire (~1h default) — benches must propose fresh, not resume stale ones
+- fat contract accounts can't be deleted in one tx (DeleteAccountWithLargeState)
+- near-cli-rs exit codes lie on transient RPC errors — verify by polling state
