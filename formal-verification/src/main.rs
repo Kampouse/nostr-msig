@@ -549,18 +549,18 @@ proof fn consumed(k: int) -> (s: Seq<bool>)
         // Consume the remaining 63 nonces — by induction (lemma `consumed`):
         // each admission marks exactly one new slot, never repeating.
         let wk = consumed(64);
-        assert forall |i: int| 0 <= i < 64 ==> wk[i] by {}
-        assert forall |n: int| 0 <= n < 64 ==> used_slot(0, wk, n) by {}
+        assert forall |i: int| 0 <= i < 64 implies wk[i] by {}
+        assert forall |n: int| 0 <= n < 64 implies used_slot(0, wk, n) by {}
 
         // Slide: base 0 → 64, fresh window. Every past nonce is now dead:
         let base2: u64 = 64u64;
         let w2 = Seq::new(64, |_i: int| false);
-        assert forall |n: int| 0 <= n < 64 ==> !in_window(base2, n) by {}
+        assert forall |n: int| 0 <= n < 64 implies !in_window(base2, n) by {}
         assert((base2 as int) == 64int);
-        assert forall |n: int| n < 64 ==> !in_window(base2, n) by {
+        assert forall |n: int| n < 64 implies !in_window(base2, n) by {
             if n < 64int { assert(!(n >= 64int)); }
         }
-        assert forall |n: int| 0 <= n < 64 ==> !mark_ok(base2, w2, n) by {
+        assert forall |n: int| 0 <= n < 64 implies !mark_ok(base2, w2, n) by {
             if 0 <= n < 64 { assert(!in_window(base2, n)); }
         }
 
