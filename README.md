@@ -1,6 +1,6 @@
-# clear-msig
+# nostr-msig
 
-**Clear-signing multisig for NEAR Protocol.**
+**Clear-signing multisig for NEAR Protocol — with agent delegation (v5).**
 
 > **Note:** This is a NEAR Protocol port of [ChewingGlass/clear-msig](https://github.com/ChewingGlass/clear-msig), the original clear-sign multisig built for Solana using [Quasar](https://github.com/blueshift-gg/quasar).
 
@@ -12,7 +12,7 @@ Traditional multisigs have signers approve hashes of serialized transactions. **
 
 1. **Intents** define what operations a wallet can perform (transfer NEAR, transfer FTs, deposit, custom actions)
 2. **Proposals** fill in the parameters and generate a human-readable message
-3. **Signers** read the message, then sign it with their ed25519 key
+3. **Signers** read the message, then sign it with their nostr key (BIP-340 schnorr — see below)
 4. **Execution** happens only when enough approvals are collected (after timelock)
 
 ### Message Format
@@ -27,6 +27,58 @@ expires 1893456000.000000000: propose transfer 1000000000000000000000000 yoctoNE
 ```
 
 No ambiguity. Signers know exactly what they're approving.
+
+## The Nostr Angle
+
+Why is this called **nostr**-msig? Because every authority in the system — owners, guardians, and agents — is a **nostr identity** (an `npub`, a BIP-340 x-only public key):
+
+- **You sign with your nostr key.** The message is a plain string; the signature is BIP-340 schnorr over `sha256(message)` — the exact key format and signing scheme used by every nostr client (Damus, Primal, Amethyst…). If you already have a nostr key pair, you already have a signer key for this contract.
+- **Nostr identities, not NEAR accounts, hold authority.** Owners are npubs, the guardian is an npub, and v5 agents are *independent nostr identities* — a second npub that can approve proposals within its scope without ever holding a NEAR full-access key.
+- **Nostr *keys*, not the nostr *network*.** The contract never talks to relays. It verifies schnorr signatures on-chain, same as it would verify any signature. No relay dependency, no event kinds — just the key format, because it's a well-tooled, human-ownable identity standard.
+
+The practical payoff: key management, backup, and identity portability come from the nostr ecosystem instead of a bespoke scheme. A nostr hardware key manager or nsec bunker can be the custodian of a treasury signer, and any future nostr tooling that can sign a message can operate this multisig.
+
+## v5 Agent Delegation (Current)
+
+v5 is the flagship: **scoped agent keys that act autonomously on a wallet** — propose, approve, and execute via their own self-funded gas keys, no relayer, no full-access key ever granted. Proven live on testnet (Aug 2026): propose → agent-npub approve (a second, independent nostr identity) → execute, all via pure-JS TransactionV1 gas-key transactions; 0.02Ⓝ moved exactly; out-of-scope agent execute rejected at protocol level; drain + revoke swept all 13 gas keys with 0.249Ⓝ recovered and zero keys left on the account.
+
+### Method-scoped session keys
+
+`add_session_key` now accepts a `methods` parameter — the gas key is scoped to a subset of `["submit_action", "session_ping", "propose", "approve", "execute", "amend", "cancel_vote"]` at the **protocol level** (enforced in `SESSION_KEY_ALLOWED_METHODS` dispatch). Crucially, widening the *transport* scope never widens *authority*: governance methods (`propose`/`approve`/`execute`/…) still verify their own nostr signatures internally. The gas key only pays postage — the npub signature still gates every action.
+
+Typical v5 setup:
+- **Owner key**: scoped to `[submit_action, session_ping, propose, approve, execute]`
+- **Agent key**: scoped to `[approve, session_ping]` — it can co-sign approvals on its own gas budget, nothing else
+
+### The agent flow (proven on-chain)
+
+1. Owner proposes a transfer (e.g. `AgentTransfer` intent where the agent npub is an approver)
+2. **The agent approves via its own scoped gas key** — TransactionV1, self-funded, no owner signature on the transaction
+3. Owner (or a delegated key) executes → funds move
+4. Any attempt to call a method outside the key's scope is rejected by the runtime before contract logic even runs
+5. Cleanup: drain the gas-key escrow back to the wallet ledger, then revoke — remaining balance burns, keys vanish
+
+Guardrails (all on-chain): wallet ledger debited for key funding, minimum wallet reserve enforced, lifetime gas-key funding capped (≤1Ⓝ per key), pause blocks sessions too, sessions hard-bound to one wallet.
+
+### Formal verification
+
+The core invariants are machine-verified with [Verus](https://github.com/verus-lang/verus) — **23 properties proved, 0 errors**. Highlights:
+
+| ID | Property |
+|----|----------|
+| P7 | Gas-escrow conservation: `funded == burned + drained + balance` after every escrow op; overdraft unrepresentable |
+| P8 | Method-scope enforcement: `dispatch(m).is_ok() ⟺ m ∈ methods` — an approve-only agent key can never propose/execute/submit |
+| P9 | Nonce-window replay resistance: consumed nonces can never be consumed again; past nonces die when the window slides |
+
+(Plus P1–P6: approval/cancellation bitmap mutual exclusion, threshold correspondence, state-transition validity, vote reset correctness, and balance conservation.) See `formal-verification/README.md` for the full table and how to re-run the proofs.
+
+### Verdicts
+
+The testbench harness (`testbench/`) writes machine-checkable verdict files per run: `v5-final-verdict.json` (flagship flow ok) and `cleanup-verdict.json` (drain + revoke PASS, `gasKeysLeft: 0`). One command re-verifies the whole surface end-to-end on testnet — see `testbench/README.md`.
+
+### Consumer-mode UI mockup
+
+`testbench/mockup.png` — the v5 guardrails rendered as plain English: a proposals inbox, key cards with scope chips + gas gauges, a zero-full-access banner, and an agent kill-switch over the live event feed.
 
 ## v3 Security Upgrade
 
@@ -260,8 +312,9 @@ Storage is charged per unique token tracked (100 bytes per token from the storag
 
 ### Deployed
 
-- **Testnet**: `cmsig.kampouse.testnet`
-- **Repo**: [github.com/Kampouse/clear-msig](https://github.com/Kampouse/clear-msig)
+- **Testnet (v3 era)**: `cmsig.kampouse.testnet`
+- **Testnet (v4/v5 bench deployments)**: `benchv5.vault.kampy.testnet` and siblings under `vault.kampy.testnet` (see `testbench/README.md`)
+- **Repo**: [github.com/Kampouse/nostr-msig](https://github.com/Kampouse/nostr-msig)
 
 ### Wallet Management
 
