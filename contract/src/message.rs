@@ -174,8 +174,6 @@ mod tests {
         ));
     }
 
-    use super::*;
-
     fn make_test_intent() -> Intent {
         Intent {
             wallet_name: "treasury".to_string(),

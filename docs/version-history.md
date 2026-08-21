@@ -73,7 +73,7 @@ node deploy2.cjs <account-id> <path/to/contract.wasm>
 
 ## v4 Session Keys (NEP-611 Gas Keys)
 
-v4 added **relayer-free session keys**: a client-held ed25519 key that can submit pre-authorized actions to a wallet **without a relayer paying gas**, implemented with [NEP-611 gas keys](https://github.com/near/NEPs/pull/611). Requires protocol ≥85 (testnet/mainnet current) and near-sdk 5.29. Unit tests (`cd contract && cargo +1.95.0 test`, 16 green incl. all 11 v3 tests) and the on-chain e2e (`node e2e-v4.cjs`) both pass green. v5 extends them with method scoping and agent delegation.
+v4 added **relayer-free session keys**: a client-held ed25519 key that can submit pre-authorized actions to a wallet **without a relayer paying gas**, implemented with [NEP-611 gas keys](https://github.com/near/NEPs/pull/611). Requires protocol ≥85 (testnet/mainnet current) and near-sdk 5.29. Unit tests (`cd contract && cargo test` — toolchain pinned to 1.95.0 in `contract/rust-toolchain.toml`, 22 green incl. all v3/v4/BIP-340/migrate-guard tests) and the on-chain e2e (`node e2e-v4.cjs`) both pass green. v5 extends them with method scoping and agent delegation.
 
 ### How NEP-611 gas keys work
 
@@ -122,3 +122,14 @@ near contract call-function as-transaction nmsig.vault.kampy.testnet submit_acti
 - Chains supporting protocol ≥85 (testnet & mainnet today) accept gas keys; older chains reject TransactionV1.
 - Session keys only pay for gas — the owner nostr signature still gates every action, pause blocks sessions too, and a session is hard-bound to one wallet (`ERR_SESSION_WALLET_MISMATCH` otherwise).
 - RPC quirk: `view_access_key` takes the **base58** (`ed25519:…`) form of the key, while contract args use raw 64-hex.
+
+### Tier-1 security hardening (Aug 21, 2026)
+
+**migrate() access guard.** `migrate()` was callable by anyone with no state-version check. On the live v5 state the borsh trailing-bytes mismatch makes re-migration fail, but any future prefix-compatible layout would have let a griefer re-run it and silently **wipe all registered session keys** (state rebuilt from the v3 subset, empty session registries). Fixed with a strict one-shot guard:
+
+- `assert_eq!(old.version, 3, "ERR_NOT_V3_STATE")` — migration only ever fires on genuine v3 state
+- Covered by 3 unit tests: legit v3→v5 migration (state carried, sessions empty), re-migration against v5 state panics, and a forced prefix-compatible v4/v5-shaped state is rejected by the version assert
+
+**BIP-340 conformance.** All 19 official test vectors from [bip-0340/test-vectors.csv](https://github.com/bitcoin/bips/blob/master/bip-0340/test-vectors.csv) (incl. the 2022-12 variable-length additions) pass through the exact on-chain verify primitive (`k256::schnorr::VerifyingKey::verify_raw` — the call `try_schnorr_verify` makes after the nostr-style `sha256(clear_sign_text)` pre-hash). Edge cases covered: pubkey not on curve, pubkey x ≥ field size, R.y odd, negated message/s, s ≥ curve order, sG−eP = infinity, non-curve R.x, msg ≥ p unreduced. Also verified: secret-key→x-only-pubkey derivation matches the vectors (nostr wallet compatibility), and the contract's manual `sha256 → verify_raw` path is byte-identical to k256's own `Verifier::verify`.
+
+**Build hygiene.** `contract/rust-toolchain.toml` was stale at 1.86 (April-era, near-sdk 5.9); the locked deps require ≥1.93 — pinned to 1.95.0. Removed a duplicate `use super::*` in `message.rs`.

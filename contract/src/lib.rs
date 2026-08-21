@@ -507,7 +507,7 @@ pub struct Contract {
 }
 
 /// v3 contract state (before session keys) — used only for state migration.
-#[derive(BorshDeserialize)]
+#[derive(BorshDeserialize, BorshSerialize)]
 #[borsh(crate = "near_sdk::borsh")]
 struct ContractV3 {
     version: u32,
@@ -1012,12 +1012,20 @@ impl Contract {
         }
     }
 
-    /// Migrate v3 state to v4 (adds empty session registries).
-    /// Call once after deploying v4 code over a v3 contract.
+    /// Migrate v3 state to v5 (adds empty session registries).
+    /// Call once after deploying v5 code over a v3 contract.
+    ///
+    /// Guards (Tier-1 hardening):
+    /// - Deserialization guard: a current v5 state fails to deserialize as
+    ///   `ContractV3` (trailing session registry bytes) → `ERR_NO_PREVIOUS_STATE`.
+    /// - One-shot guard: `assert_eq!(old.version, 3)` — if a future layout ever
+    ///   deserializes prefix-compatible, re-running migrate() aborts instead of
+    ///   silently rebuilding state (which would wipe all registered session keys).
     #[init(ignore_state)]
     pub fn migrate() -> Self {
         let old: ContractV3 = env::state_read().expect("ERR_NO_PREVIOUS_STATE");
-        log!("Migrated contract state v{} -> v4", old.version);
+        assert_eq!(old.version, 3, "ERR_NOT_V3_STATE");
+        log!("Migrated contract state v{} -> v5", old.version);
         old.into()
     }
 
@@ -2573,6 +2581,9 @@ impl Contract {
 }
 
 #[cfg(test)]
+mod bip340_tests;
+
+#[cfg(test)]
 // mod verification;
 #[cfg(test)]
 // mod integration_tests;
@@ -2582,6 +2593,104 @@ impl Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── migrate() guard tests (Tier-1 hardening) ─────────────────────────
+    //
+    // Seeds the mock VM STATE key directly with borsh-serialized state and
+    // proves: (1) v3 state migrates to v5 with empty session registries,
+    // (2) re-running migrate() against the resulting v5 state panics
+    //     (trailing-bytes deserialize failure → ERR_NO_PREVIOUS_STATE),
+    // (3) a v5-shaped state that *would* deserialize as ContractV3 (forced
+    //     via a version-3 first field, prefix-compatible layout scenario)
+    //     is rejected by the version assert → ERR_NOT_V3_STATE.
+    mod migrate_guard {
+        use super::super::*;
+        use near_sdk::borsh::BorshSerialize;
+        use near_sdk::{testing_env, test_utils::VMContextBuilder};
+
+        fn init_test_env() {
+            let ctx = VMContextBuilder::new().build();
+            testing_env!(ctx);
+        }
+
+        fn seed_state<T: BorshSerialize>(state: &T) {
+            let bytes = near_sdk::borsh::to_vec(state).expect("serialize state");
+            near_sdk::env::storage_write(b"STATE", &bytes);
+        }
+
+        fn make_v3() -> ContractV3 {
+            ContractV3 {
+                version: 3,
+                owner_npubs: vec!["6a04ab98d9e4774ad806e302dddeb63bea16b5cb5f223ee77478e861bb583eb3".into()],
+                guardian_npub: None,
+                wallets: LookupMap::new(StorageKey::Wallets),
+                intents: LookupMap::new(StorageKey::Intents),
+                proposals: LookupMap::new(StorageKey::Proposals),
+                delegations: LookupMap::new(StorageKey::Delegations),
+                event_nonce: 7,
+                owner_nonce: 42,
+                owner_nonce_bitmap: 0,
+                wallet_names: Vector::new(StorageKey::WalletNames),
+                paused: false,
+                locked: false,
+            }
+        }
+
+        #[test]
+        fn migrate_v3_to_v5_preserves_state_and_empties_sessions() {
+            init_test_env();
+            seed_state(&make_v3());
+
+            let migrated = Contract::migrate();
+            assert_eq!(migrated.version, 5, "migrated contract must be v5");
+            assert_eq!(migrated.event_nonce, 7, "state fields carried over");
+            assert_eq!(migrated.owner_nonce, 42, "nonce window carried over");
+            assert!(
+                migrated.session_keys.is_empty(),
+                "session registries start empty"
+            );
+        }
+
+        #[test]
+        fn remigrate_against_v5_state_panics() {
+            init_test_env();
+            // Realistic scenario: v5 state on chain (post-migration), someone
+            // calls migrate() again. The v5 bytes contain trailing session
+            // registry serialization that cannot deserialize as ContractV3.
+            seed_state(&make_v3());
+            let migrated = Contract::migrate();
+            seed_state(&migrated); // v5-shaped state now under STATE
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Contract::migrate();
+            }));
+            assert!(result.is_err(), "re-migration must panic");
+        }
+
+        #[test]
+        fn remigrate_prefix_compatible_v5_state_blocked_by_version_assert() {
+            init_test_env();
+            // Adversarial layout scenario: future state that happens to
+            // deserialize cleanly as ContractV3 (no trailing bytes) but is
+            // NOT v3 — version field differs → assert fires, state untouched.
+            let mut fake = make_v3();
+            fake.version = 5; // pretend current state reports v5
+            seed_state(&fake);
+
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Contract::migrate();
+            }));
+            assert!(result.is_err(), "version-5 state must not re-migrate");
+            // And prove the guard specifically: v4-shaped prefix state too.
+            let mut fake4 = make_v3();
+            fake4.version = 4;
+            seed_state(&fake4);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Contract::migrate();
+            }));
+            assert!(result.is_err(), "version-4 state must not re-migrate");
+        }
+    }
 
     #[test]
     fn test_normalize_pk_hex() {
